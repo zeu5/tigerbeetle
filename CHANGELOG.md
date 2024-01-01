@@ -1,5 +1,245 @@
 # TigerBeetle Changelog
 
+## 2023-12-20
+
+_“The exception confirms the rule in cases not excepted."_ ― Cicero.
+
+Due to significant commits we had this last week, we decided to make an exception
+in our release schedule and cut one more release in 2023!
+
+Still, **the TigerBeetle team wishes everyone happy holidays!** 🎁
+
+### Internals
+
+- [#1362](https://github.com/tigerbeetle/tigerbeetle/pull/1362),
+  [#1367](https://github.com/tigerbeetle/tigerbeetle/pull/1367),
+  [#1374](https://github.com/tigerbeetle/tigerbeetle/pull/1374),
+  [#1375](https://github.com/tigerbeetle/tigerbeetle/pull/1375)
+
+  Some CI-related stuff plus the `-Drelease` flag, which will bring back the joy of
+  using the compiler from the command line 🤓.
+
+- [#1373](https://github.com/tigerbeetle/tigerbeetle/pull/1373)
+
+  Added value count to `TableInfo`, allowing future optimizations for paced compaction.
+
+### Safety And Performance
+
+- [#1346](https://github.com/tigerbeetle/tigerbeetle/pull/1346)
+
+  The simulator found a failure when the WAL gets corrupted near a checkpoint boundary, leading us
+  to also consider scenarios where corrupted blocks in the grid end up "intersecting" with
+  corruption in the WAL, making the state unrecoverable where it should be. We fixed it by
+  extending the durability of "prepares", evicting them from the WAL only when there's a quorum of
+  checkpoints covering this "prepare".
+
+- [#1366](https://github.com/tigerbeetle/tigerbeetle/pull/1366)
+
+  Fix a unit test that regressed after we changed an undesirable behavior that allowed `prefetch`
+  to invoke its callback synchronously.
+
+- [#1381](https://github.com/tigerbeetle/tigerbeetle/pull/1381)
+
+  Relaxed a simulator's verification, allowing replicas of the core cluster to be missing some
+  prepares, as long as they are from a past checkpoint.
+
+### Features
+
+- [#1054](https://github.com/tigerbeetle/tigerbeetle/pull/1054)
+
+  A highly anticipated feature lands on TigerBeetle: it's now possible to retrieve the transfers
+  involved with a given account by using the new operation `get_account_transfers`.
+
+  Note that this feature itself is an ad-hoc API intended to be replaced once we have a proper
+  Querying API. The real improvement of this PR is the implementation of range queries, enabling
+  us to land exciting new features on the next releases.
+
+- [#1368](https://github.com/tigerbeetle/tigerbeetle/pull/1368)
+
+  Bump the client's maximum limit and the default value of `concurrency_max` to fully take
+  advantage of the batching logic.
+
+### TigerTracks 🎧
+
+- [Everybody needs somebody](https://www.youtube.com/watch?v=m1M5Tc7eLCo)
+
+## 2023-12-18
+
+*As the last release of the year 2023, the TigerBeetle team wishes everyone happy holidays!* 🎁
+
+### Internals
+
+- [#1359](https://github.com/tigerbeetle/tigerbeetle/pull/1359)
+
+  We've established a rotation between the team for handling releases. As the one writing these
+  release notes, I am now quite aware.
+
+- [#1357](https://github.com/tigerbeetle/tigerbeetle/pull/1357)
+
+  Fix panic in JVM unit test on Java 21. We test JNI functions even if they're not used by the Java
+  client and the semantics have changed a bit since Java 11.
+
+- [#1351](https://github.com/tigerbeetle/tigerbeetle/pull/1351),
+  [#1356](https://github.com/tigerbeetle/tigerbeetle/pull/1356),
+  [#1360](https://github.com/tigerbeetle/tigerbeetle/pull/1360)
+
+  Move client sessions from the Superblock (database metadata) into the Grid (general storage). This
+  simplifies control flow for various sub-components like Superblock checkpointing and Replica state
+  sync.
+
+### Safety And Performance
+
+- [#1352](https://github.com/tigerbeetle/tigerbeetle/pull/1352)
+
+  An optimization for removes on secondary indexes makes a return. Now tombstone values in the LSM
+  can avoid being compacted all the way down to the lowest level if they can be cancelled out by
+  inserts.
+
+- [#1257](https://github.com/tigerbeetle/tigerbeetle/pull/1257)
+
+  Clients automatically batch pending similar requests 🎉! If a tigerbeetle client submits a
+  request, and one with the same operation is currently in-flight, they will be grouped and
+  processed together where possible (currently, only for `CreateAccount` and `CreateTransfers`).
+  This should [greatly improve the performance](https://github.com/tigerbeetle/tigerbeetle/pull/1257#issuecomment-1812648270)
+  of workloads which submit a single operation at a time.
+
+### TigerTracks 🎧
+
+- [Carouselambra](https://open.spotify.com/track/0YZKbKo9i91i7LD0m1KASq)
+
+## 2023-12-11
+
+### Safety And Performance
+
+- [#1339](https://github.com/tigerbeetle/tigerbeetle/pull/1339)
+
+  Defense in depth: add checkpoint ID to prepare messages. Checkpoint ID is a hash that covers, via
+  hash chaining, the entire state stored in the data file. Verifying that checkpoint IDs match
+  provides a direct strong cryptographic guarantee that the state is the same across replicas, on
+  top of existing guarantee that the sequence of events leading to the state is identical.
+
+### Internals
+
+- [#1343](https://github.com/tigerbeetle/tigerbeetle/pull/1343),
+  [#1341](https://github.com/tigerbeetle/tigerbeetle/pull/1341),
+  [#1340](https://github.com/tigerbeetle/tigerbeetle/pull/1340)
+
+  Gate the main branch on more checks: unit-tests for NodeJS and even more fuzzers.
+
+- [#1332](https://github.com/tigerbeetle/tigerbeetle/pull/1332),
+  [#1348](https://github.com/tigerbeetle/tigerbeetle/pull/1348)
+
+  Code cleanups after removal of storage size limit.
+
+### TigerTracks 🎧
+
+- [Concrete Reservation](https://open.spotify.com/track/1Li9HBLXG2LJSeD4fEhtcd?si=64611215922a4436)
+
+## 2023-12-04
+
+### Safety And Performance
+
+- [#1330](https://github.com/tigerbeetle/tigerbeetle/pull/1330),
+  [#1319](https://github.com/tigerbeetle/tigerbeetle/pull/1319)
+
+  Fix free set index. The free set is a bitset of free blocks in the grid. To speed up block
+  allocation, the free set also maintains an index --- a coarser-grained bitset where a single bit
+  corresponds to 1024 blocks. Maintaining consistency between a data structure and its index is
+  hard, and thorough assertions are crucial. When moving free set to the grid, we discovered that,
+  in fact, we don't have enough assertions in this area and, as a result, even have a bug!
+  Assertions added, bug removed!
+
+- [#1323](https://github.com/tigerbeetle/tigerbeetle/pull/1323),
+  [#1336](https://github.com/tigerbeetle/tigerbeetle/pull/1336),
+  [#1324](https://github.com/tigerbeetle/tigerbeetle/pull/1324)
+
+  LSM tree fuzzer found a couple of bugs in its own code.
+
+### Features
+
+- [#1331](https://github.com/tigerbeetle/tigerbeetle/pull/1331),
+  [#1322](https://github.com/tigerbeetle/tigerbeetle/pull/1322),
+  [#1328](https://github.com/tigerbeetle/tigerbeetle/pull/1328)
+
+  Remove format-time limit on the size of the data file. Before, the maximum size of the data file
+  affected the layout of the superblock, and there wasn't any good way to increase this limit, short
+  of recreating the cluster from scratch. Now, this limit only applies to the in-memory data
+  structures: when a data files grows large, it is sufficient to just restart its replica with a
+  larger amount of RAM.
+
+- [#1321](https://github.com/tigerbeetle/tigerbeetle/pull/1321).
+
+  We finally have the "installation" page in our docs!
+
+### Internals
+
+- [#1334](https://github.com/tigerbeetle/tigerbeetle/pull/1334)
+
+  Use Zig's new `if (@inComptime())` builtin to compute checksum of an empty byte slice at compile
+  time.
+
+- [#1315](https://github.com/tigerbeetle/tigerbeetle/pull/1315)
+
+  Fix unit tests for the Go client and add them to
+  [not rocket science](https://graydon2.dreamwidth.org/1597.html)
+  set of checks.
+
+### TigerTracks 🎧
+
+- [Times Like These](https://www.youtube.com/watch?v=cvCUXXsP5WE)
+
+## 2023-11-27
+
+### Internals
+
+- [#1306](https://github.com/tigerbeetle/tigerbeetle/pull/1306),
+  [#1308](https://github.com/tigerbeetle/tigerbeetle/pull/1308)
+
+  When validating our releases, use the `release` branch instead of `main` to ensure everything is
+  in sync, and give the Java validation some retry logic to allow for delays in publishing to
+  Central.
+
+- [#1310](https://github.com/tigerbeetle/tigerbeetle/pull/1310)
+
+  Pad storage checksums from 128-bit to 256-bit. These are currently unused, but we're reserving
+  the space for AEAD tags in future.
+
+- [#1312](https://github.com/tigerbeetle/tigerbeetle/pull/1312)
+
+  Remove a trailing comma in our Java client sample code.
+
+- [#1313](https://github.com/tigerbeetle/tigerbeetle/pull/1313)
+
+  Switch `bootstrap.sh` to use spaces only for indentation and ensure it's checked by our
+  shellcheck lint.
+
+- [#1314](https://github.com/tigerbeetle/tigerbeetle/pull/1314)
+
+  Update our `DESIGN.md` to better reflect storage fault probabilities and add in a reference.
+
+- [#1316](https://github.com/tigerbeetle/tigerbeetle/pull/1316)
+
+  Add `CHANGELOG.md` validation to our tidy lint script. We now check line length limits and
+  trailing whitespace.
+
+- [#1317](https://github.com/tigerbeetle/tigerbeetle/pull/1317)
+
+  In keeping with
+  [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md#naming-things),
+  rename `reserved_nonce` to `nonce_reserved`.
+
+- [#1318](https://github.com/tigerbeetle/tigerbeetle/pull/1318)
+
+  Note in TigerStyle that callbacks go last in the list of parameters.
+
+- [#1325](https://github.com/tigerbeetle/tigerbeetle/pull/1325)
+
+  Add an exception for line length limits if there's a link in said line.
+
+### TigerTracks 🎧
+
+- [Space Trash](https://www.youtube.com/watch?v=tmcVAJd87Wk)
+
 ## 2023-11-20
 
 ### Safety And Performance

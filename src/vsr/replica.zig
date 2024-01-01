@@ -9,11 +9,11 @@ const stdx = @import("../stdx.zig");
 const StaticAllocator = @import("../static_allocator.zig");
 const allocate_block = @import("grid.zig").allocate_block;
 const GridType = @import("grid.zig").GridType;
+const BlockPtr = @import("grid.zig").BlockPtr;
 const IOPS = @import("../iops.zig").IOPS;
 const MessagePool = @import("../message_pool.zig").MessagePool;
 const Message = @import("../message_pool.zig").MessagePool.Message;
 const RingBuffer = @import("../ring_buffer.zig").RingBuffer;
-const ClientSessions = @import("superblock_client_sessions.zig").ClientSessions;
 const ForestTableIteratorType =
     @import("../lsm/forest_table_iterator.zig").ForestTableIteratorType;
 const TestStorage = @import("../testing/storage.zig").Storage;
@@ -28,7 +28,7 @@ const SyncStage = vsr.SyncStage;
 const SyncTarget = vsr.SyncTarget;
 const SyncTargetCandidate = vsr.SyncTargetCandidate;
 const SyncTargetQuorum = vsr.SyncTargetQuorum;
-const SyncTrailer = vsr.SyncTrailer;
+const ClientSessions = vsr.ClientSessions;
 
 const log = stdx.log.scoped(.replica);
 const tracer = @import("../tracer.zig");
@@ -62,7 +62,8 @@ const CommitStage = enum {
     compact_state_machine,
     checkpoint_state_machine,
     checkpoint_client_replies,
-    checkpoint_grid_repair,
+    checkpoint_client_sessions,
+    checkpoint_grid,
     checkpoint_superblock,
     /// A commit just finished. Clean up before proceeding to the next.
     cleanup,
@@ -128,6 +129,7 @@ pub fn ReplicaType(
         const Self = @This();
 
         pub const SuperBlock = vsr.SuperBlockType(Storage);
+        const CheckpointTrailer = vsr.CheckpointTrailerType(Storage);
         const Journal = vsr.JournalType(Self, Storage);
         const ClientReplies = vsr.ClientRepliesType(Storage);
         const Clock = vsr.ClockType(Time);
@@ -199,6 +201,12 @@ pub fn ReplicaType(
         /// The persistent log of hash-chained journal entries:
         journal: Journal,
 
+        /// ClientSessions records for each client the latest session and the latest committed reply.
+        /// This is modified between checkpoints, and is persisted on checkpoint and sync.
+        client_sessions: ClientSessions,
+
+        client_sessions_checkpoint: CheckpointTrailer,
+
         /// The persistent log of the latest reply per active client.
         client_replies: ClientReplies,
 
@@ -225,7 +233,7 @@ pub fn ReplicaType(
         grid_reads: IOPS(BlockRead, constants.grid_repair_reads_max) = .{},
         grid_repair_tables: IOPS(RepairTable, constants.grid_missing_tables_max) = .{},
         grid_repair_writes: IOPS(BlockWrite, constants.grid_repair_writes_max) = .{},
-        grid_repair_write_blocks: [constants.grid_repair_writes_max]Grid.BlockPtr,
+        grid_repair_write_blocks: [constants.grid_repair_writes_max]BlockPtr,
 
         opened: bool,
 
@@ -461,7 +469,7 @@ pub fn ReplicaType(
 
         /// Initializes and opens the provided replica using the options.
         pub fn open(self: *Self, parent_allocator: std.mem.Allocator, options: OpenOptions) !void {
-            assert(options.storage_size_limit <= constants.storage_size_max);
+            assert(options.storage_size_limit <= constants.storage_size_limit_max);
             assert(options.storage_size_limit % constants.sector_size == 0);
             assert(options.nonce != 0);
 
@@ -658,9 +666,9 @@ pub fn ReplicaType(
             maybe(self.status == .recovering_head);
             if (self.status == .recovering) assert(self.solo());
 
-            // Asynchronously open the (Forest inside) StateMachine so that we can repair grid
-            // blocks if necessary:
-            self.state_machine.open(state_machine_open_callback);
+            // Asynchronously open the free set and then the (Forest inside) StateMachine so that we
+            // can repair grid blocks if necessary:
+            self.grid.open(grid_open_callback);
         }
 
         fn superblock_open_callback(superblock_context: *SuperBlock.Context) void {
@@ -675,8 +683,68 @@ pub fn ReplicaType(
             self.opened = true;
         }
 
+        fn grid_open_callback(grid: *Grid) void {
+            const self = @fieldParentPtr(Self, "grid", grid);
+            assert(!self.state_machine_opened);
+            assert(self.commit_stage == .idle);
+            assert(self.syncing == .idle);
+            assert(self.sync_tables == null);
+            assert(self.grid_repair_tables.executing() == 0);
+            assert(self.grid.free_set.count_released() == self.grid.free_set_checkpoint.block_count());
+            assert(std.meta.eql(
+                grid.free_set_checkpoint.checkpoint_reference(),
+                self.superblock.working.free_set_reference(),
+            ));
+
+            // TODO This can probably be performed concurrently to StateMachine.open().
+            self.client_sessions_checkpoint.open(
+                &self.grid,
+                self.superblock.working.client_sessions_reference(),
+                client_sessions_open_callback,
+            );
+        }
+
+        fn client_sessions_open_callback(client_sessions_checkpoint: *CheckpointTrailer) void {
+            const self = @fieldParentPtr(Self, "client_sessions_checkpoint", client_sessions_checkpoint);
+            assert(!self.state_machine_opened);
+            assert(self.commit_stage == .idle);
+            assert(self.syncing == .idle);
+            assert(self.sync_tables == null);
+            assert(self.grid_repair_tables.executing() == 0);
+            assert(self.client_sessions.entries_free.count() == constants.clients_max);
+            assert(std.meta.eql(
+                self.client_sessions_checkpoint.checkpoint_reference(),
+                self.superblock.working.client_sessions_reference(),
+            ));
+
+            {
+                const checkpoint = &self.client_sessions_checkpoint;
+                var address_previous: u64 = 0;
+                for (checkpoint.block_addresses[0..checkpoint.block_count()]) |address| {
+                    assert(address > 0);
+                    assert(address > address_previous);
+                    address_previous = address;
+                    self.grid.release(address);
+                }
+            }
+
+            const trailer_buffer = self.client_sessions_checkpoint.buffer;
+            const trailer_size = self.client_sessions_checkpoint.size;
+
+            if (self.superblock.working.client_sessions_reference().empty()) {
+                assert(trailer_size == 0);
+            } else {
+                assert(trailer_size == ClientSessions.encode_size);
+
+                self.client_sessions.decode(trailer_buffer[0..trailer_size]);
+            }
+
+            self.state_machine.open(state_machine_open_callback);
+        }
+
         fn state_machine_open_callback(state_machine: *StateMachine) void {
             const self = @fieldParentPtr(Self, "state_machine", state_machine);
+            assert(self.grid.free_set.opened);
             assert(!self.state_machine_opened);
             assert(self.commit_stage == .idle);
             assert(self.syncing == .idle);
@@ -799,6 +867,16 @@ pub fn ReplicaType(
             self.journal = try Journal.init(allocator, options.storage, replica_index);
             errdefer self.journal.deinit(allocator);
 
+            var client_sessions = try ClientSessions.init(allocator);
+            errdefer client_sessions.deinit(allocator);
+
+            var client_sessions_checkpoint = try CheckpointTrailer.init(
+                allocator,
+                .client_sessions,
+                ClientSessions.encode_size,
+            );
+            errdefer client_sessions_checkpoint.deinit(allocator);
+
             var client_replies = ClientReplies.init(.{
                 .storage = options.storage,
                 .message_pool = options.message_pool,
@@ -854,6 +932,8 @@ pub fn ReplicaType(
                 .time = self.time,
                 .clock = self.clock,
                 .journal = self.journal,
+                .client_sessions = client_sessions,
+                .client_sessions_checkpoint = client_sessions_checkpoint,
                 .client_replies = client_replies,
                 .message_bus = self.message_bus,
                 .state_machine = self.state_machine,
@@ -964,6 +1044,8 @@ pub fn ReplicaType(
             self.static_allocator.transition_from_static_to_deinit();
 
             self.client_replies.deinit();
+            self.client_sessions_checkpoint.deinit(allocator);
+            self.client_sessions.deinit(allocator);
             self.journal.deinit(allocator);
             self.clock.deinit(allocator);
             self.state_machine.deinit(allocator);
@@ -995,11 +1077,6 @@ pub fn ReplicaType(
             for (self.do_view_change_from_all_replicas) |message| {
                 if (message) |m| self.message_bus.unref(m);
             }
-        }
-
-        /// ClientSessions records for each client the latest session and the latest committed reply.
-        inline fn client_sessions(self: *Self) *ClientSessions {
-            return &self.superblock.client_sessions;
         }
 
         /// Time is measured in logical ticks that are incremented on every call to tick().
@@ -1119,10 +1196,6 @@ pub fn ReplicaType(
                 .block => |m| self.on_block(m),
                 .request_sync_checkpoint => |m| self.on_request_sync_checkpoint(m),
                 .sync_checkpoint => |m| self.on_sync_checkpoint(m),
-                .request_sync_free_set => self.on_request_sync_trailer(message),
-                .request_sync_client_sessions => self.on_request_sync_trailer(message),
-                .sync_free_set => self.on_sync_trailer(.free_set, message),
-                .sync_client_sessions => self.on_sync_trailer(.client_sessions, message),
                 // A replica should never handle misdirected messages intended for a client:
                 .pong_client, .eviction => {
                     log.warn("{}: on_message: misdirected message ({s})", .{
@@ -1164,6 +1237,7 @@ pub fn ReplicaType(
                 .command = .pong,
                 .cluster = self.cluster,
                 .replica = self.replica,
+                .view = self.view_durable(), // Don't drop pongs while the view is being updated.
                 // Copy the ping's monotonic timestamp to our pong and add our wall clock sample:
                 .ping_timestamp_monotonic = message.header.ping_timestamp_monotonic,
                 .pong_timestamp_wall = @as(u64, @bitCast(self.clock.realtime())),
@@ -1321,6 +1395,34 @@ pub fn ReplicaType(
                 return;
             }
 
+            if (message.header.checkpoint_id != self.superblock.working.checkpoint_id()) {
+                // Reject prepares which do not match our own checkpoint id.
+                // This ensures that no replica can diverge from the canonical history by more than
+                // one checkpoint.
+                //
+                // If this branch is hit, there is a storage determinism problem. At this point in
+                // the code it is not possible to distinguish whether the problem is with this
+                // replica, the prepare's replica, or both independently. One of these replicas will
+                // need to state sync.
+                log.warn("{}: on_prepare: ignoring op={}; checkpoint_id mismatch " ++
+                    "(expect={x:0>32} received={x:0>32} from={})", .{
+                    self.replica,
+                    message.header.op,
+                    self.superblock.working.checkpoint_id(),
+                    message.header.checkpoint_id,
+                    message.header.replica,
+                });
+
+                if (self.event_callback) |hook| {
+                    hook(self, .{ .checkpoint_divergence_detected = .{
+                        .replica = message.header.replica,
+                    } });
+                }
+
+                assert(self.backup());
+                return;
+            }
+
             if (message.header.op > self.op + 1) {
                 log.debug("{}: on_prepare: newer op", .{self.replica});
                 self.jump_to_newer_op_in_normal_status(message.header);
@@ -1377,26 +1479,10 @@ pub fn ReplicaType(
                 self.pipeline.queue.prepare_queue.count);
             assert(prepare.message.header.op <= self.op);
 
-            const checkpoint_id = message.header.checkpoint_id;
-            if (checkpoint_id != self.checkpoint_id_for_op(prepare.message.header.op).?) {
-                // If this is hit, there is a storage determinism problem.
-                // One of these replicas will need to state sync.
-                log.warn("{}: on_prepare_ok: checkpoint_id mismatch " ++
-                    "(expect={x:0>32} received={x:0>32} from={} op={})", .{
-                    self.replica,
-                    self.checkpoint_id_for_op(prepare.message.header.op).?,
-                    checkpoint_id,
-                    message.header.replica,
-                    message.header.op,
-                });
-
-                if (self.event_callback) |hook| {
-                    hook(self, .{ .checkpoint_divergence_detected = .{
-                        .replica = message.header.replica,
-                    } });
-                }
-                return;
-            }
+            assert(prepare.message.header.checkpoint_id == message.header.checkpoint_id);
+            assert(prepare.message.header.checkpoint_id == self.superblock.working.checkpoint_id());
+            assert(prepare.message.header.checkpoint_id ==
+                self.checkpoint_id_for_op(prepare.message.header.op).?);
 
             // Wait until we have a quorum of prepare_ok messages (including ourself):
             const threshold = self.quorum_replication;
@@ -1441,7 +1527,7 @@ pub fn ReplicaType(
             assert(message.header.command == .reply);
             assert(message.header.replica < self.replica_count);
 
-            const entry = self.client_sessions().get(message.header.client) orelse {
+            const entry = self.client_sessions.get(message.header.client) orelse {
                 log.debug("{}: on_reply: ignoring, client not in table (client={} request={})", .{
                     self.replica,
                     message.header.client,
@@ -1459,7 +1545,7 @@ pub fn ReplicaType(
                 return;
             }
 
-            const slot = self.client_sessions().get_slot_for_header(message.header).?;
+            const slot = self.client_sessions.get_slot_for_header(message.header).?;
             if (!self.client_replies.faulty.isSet(slot.index)) {
                 log.debug("{}: on_reply: ignoring, reply is clean (client={} request={})", .{
                     self.replica,
@@ -1829,7 +1915,7 @@ pub fn ReplicaType(
             assert(message.header.replica == self.primary_index(message.header.view));
             assert(message.header.commit >= message.header.checkpoint_op);
             assert(message.header.commit - message.header.checkpoint_op <=
-                constants.journal_slot_count);
+                constants.vsr_checkpoint_interval + constants.lsm_batch_multiple);
             assert(message.header.op >= message.header.commit);
             assert(message.header.op - message.header.commit <=
                 constants.pipeline_prepare_queue_max);
@@ -2107,7 +2193,7 @@ pub fn ReplicaType(
             if (self.ignore_repair_message(message.base_const())) return;
             assert(message.header.replica != self.replica);
 
-            const entry = self.client_sessions().get(message.header.reply_client) orelse {
+            const entry = self.client_sessions.get(message.header.reply_client) orelse {
                 log.debug("{}: on_request_reply: ignoring, client not in table", .{self.replica});
                 return;
             };
@@ -2125,7 +2211,7 @@ pub fn ReplicaType(
             assert(entry.header.size != @sizeOf(Header));
             assert(entry.header.op == message.header.reply_op);
 
-            const slot = self.client_sessions().get_slot_for_header(&entry.header).?;
+            const slot = self.client_sessions.get_slot_for_header(&entry.header).?;
             if (self.client_replies.read_reply_sync(slot, entry)) |reply| {
                 on_request_reply_read_callback(
                     &self.client_replies,
@@ -2163,7 +2249,7 @@ pub fn ReplicaType(
                     reply_header.checksum,
                 });
 
-                if (self.client_sessions().get_slot_for_header(reply_header)) |slot| {
+                if (self.client_sessions.get_slot_for_header(reply_header)) |slot| {
                     self.client_replies.faulty.set(slot.index);
                 }
                 return;
@@ -2217,7 +2303,7 @@ pub fn ReplicaType(
                 return;
             }
 
-            if (self.grid.canceling) |_| {
+            if (self.grid.callback == .cancel) {
                 log.debug("{}: on_request_blocks: ignoring; canceling grid", .{self.replica});
                 return;
             }
@@ -2334,7 +2420,7 @@ pub fn ReplicaType(
             assert(message.header.size <= constants.block_size);
             assert(message.header.address > 0);
 
-            if (self.grid.canceling) |_| {
+            if (self.grid.callback == .cancel) {
                 assert(self.grid.read_global_queue.count == 0);
 
                 log.debug("{}: on_block: ignoring; grid is canceling (address={} checksum={})", .{
@@ -2349,7 +2435,7 @@ pub fn ReplicaType(
 
             const grid_fulfill = self.grid.fulfill_block(block);
             if (grid_fulfill) {
-                assert(!self.superblock.free_set.is_free(message.header.address));
+                assert(!self.grid.free_set.is_free(message.header.address));
 
                 log.debug("{}: on_block: fulfilled address={} checksum={}", .{
                     self.replica,
@@ -2361,7 +2447,7 @@ pub fn ReplicaType(
             const grid_repair =
                 self.grid.repair_block_waiting(message.header.address, message.header.checksum);
             if (grid_repair) {
-                assert(!self.superblock.free_set.is_free(message.header.address));
+                assert(!self.grid.free_set.is_free(message.header.address));
 
                 if (self.grid_repair_writes.acquire()) |write| {
                     const write_index = self.grid_repair_writes.index(write);
@@ -2420,7 +2506,7 @@ pub fn ReplicaType(
             message: *Message.RequestSyncCheckpoint,
         ) void {
             assert(message.header.command == .request_sync_checkpoint);
-            if (self.ignore_sync_request_message(message.base_const())) return;
+            if (self.ignore_request_sync_checkpoint_message(message)) return;
 
             assert(message.header.checkpoint_op ==
                 self.superblock.staging.vsr_state.checkpoint.commit_min);
@@ -2432,10 +2518,12 @@ pub fn ReplicaType(
         fn on_sync_checkpoint(self: *Self, message: *const Message.SyncCheckpoint) void {
             assert(message.header.replica < self.replica_count);
             assert(message.header.command == .sync_checkpoint);
-            if (self.ignore_sync_response_message(message.base_const())) return;
+            if (self.ignore_sync_checkpoint_message(message)) return;
 
-            const stage: *const SyncStage.RequestingTrailers = &self.syncing.requesting_trailers;
+            const stage: *const SyncStage.RequestingCheckpoint =
+                &self.syncing.requesting_checkpoint;
             assert(stage.target.checkpoint_id == message.header.checkpoint_id);
+            assert(stage.target.checkpoint_id == message.header.checksum_body);
 
             log.debug("{}: on_sync_checkpoint: checkpoint_op={} checkpoint_id={x:0>32}", .{
                 self.replica,
@@ -2443,81 +2531,10 @@ pub fn ReplicaType(
                 stage.target.checkpoint_id,
             });
 
-            const checkpoint_state = std.mem.bytesAsValue(
+            self.sync_requesting_checkpoint_callback(std.mem.bytesAsValue(
                 vsr.CheckpointState,
                 message.body()[0..@sizeOf(vsr.CheckpointState)],
-            );
-
-            if (stage.done()) {
-                self.sync_requesting_trailers_callback(checkpoint_state);
-            }
-        }
-
-        fn on_request_sync_trailer(self: *Self, message: *Message) void {
-            assert(message.header.command == .request_sync_free_set or
-                message.header.command == .request_sync_client_sessions);
-            if (self.ignore_sync_request_message(message)) return;
-
-            switch (message.header.into_any()) {
-                inline .request_sync_client_sessions,
-                .request_sync_free_set,
-                => |message_header, command| {
-                    assert(message_header.checkpoint_op ==
-                        self.superblock.staging.vsr_state.checkpoint.commit_min);
-                    assert(message_header.checkpoint_id == self.superblock.staging.checkpoint_id());
-
-                    self.send_sync_trailer(command, .{
-                        .offset = message_header.trailer_offset,
-                        .replica = message_header.replica,
-                    });
-                },
-                else => unreachable,
-            }
-        }
-
-        fn on_sync_trailer(
-            self: *Self,
-            comptime trailer: vsr.SuperBlockTrailer,
-            message: *const Message,
-        ) void {
-            assert(message.header.replica < self.replica_count);
-            assert(message.header.command == SyncTrailer.responses.get(trailer));
-            if (self.ignore_sync_response_message(message)) return;
-
-            switch (message.header.into_any()) {
-                inline .sync_client_sessions,
-                .sync_free_set,
-                => |message_header| {
-                    const stage: *SyncStage.RequestingTrailers = &self.syncing.requesting_trailers;
-                    assert(stage.target.checkpoint_id == message_header.checkpoint_id);
-
-                    log.debug("{}: on_{s}: checkpoint_op={} checkpoint_id={x:0>32}", .{
-                        self.replica,
-                        @tagName(message.header.command),
-                        stage.target.checkpoint_op,
-                        stage.target.checkpoint_id,
-                    });
-
-                    const target_buffer = self.superblock.trailer_buffer(trailer);
-                    const progress = stage.trailers.getPtr(trailer).write_chunk(.{
-                        .buffer = target_buffer,
-                        .size = message_header.trailer_size,
-                        .checksum = message_header.trailer_checksum,
-                    }, .{
-                        .chunk = message.body(),
-                        .chunk_offset = message_header.trailer_offset,
-                    });
-
-                    log.debug("{}: on_{s}: {s} ({}/{})", .{
-                        self.replica,
-                        @tagName(message.header.command),
-                        @tagName(progress),
-                        stage.trailers.get(trailer).offset,
-                        message_header.trailer_size,
-                    });
-                },
-                else => unreachable,
-            }
+            ));
         }
 
         fn on_ping_timeout(self: *Self) void {
@@ -2527,11 +2544,12 @@ pub fn ReplicaType(
                 .command = .ping,
                 .cluster = self.cluster,
                 .replica = self.replica,
-                .ping_timestamp_monotonic = self.clock.monotonic(),
-                // Checkpoint information:
+                .view = self.view_durable(), // Don't drop pings while the view is being updated.
                 .checkpoint_id = self.superblock.working.checkpoint_id(),
                 .checkpoint_op = self.op_checkpoint(),
+                .ping_timestamp_monotonic = self.clock.monotonic(),
             };
+            assert(ping.view <= self.view);
 
             self.send_header_to_other_replicas_and_standbys(ping.frame_const().*);
         }
@@ -2793,7 +2811,7 @@ pub fn ReplicaType(
             // we would need to wait for it before sync starts anyhow, and the newer
             // checkpoint might sidestep the need for sync anyhow.
             if (self.commit_stage == .checkpoint_superblock) return;
-            if (self.commit_stage == .checkpoint_grid_repair) return;
+            if (self.commit_stage == .checkpoint_grid) return;
 
             // TODO Test connectivity to cluster to rule out a network partition.
 
@@ -2856,7 +2874,7 @@ pub fn ReplicaType(
             maybe(self.state_machine_opened);
 
             self.grid_repair_message_timeout.reset();
-            if (self.grid.canceling == null) {
+            if (self.grid.callback != .cancel) {
                 self.send_request_blocks();
             }
         }
@@ -2876,18 +2894,7 @@ pub fn ReplicaType(
                 .updating_superblock,
                 => return,
 
-                .requesting_trailers => |*stage| {
-                    self.send_request_sync_checkpoint();
-
-                    inline for (comptime std.enums.values(vsr.SuperBlockTrailer)) |trailer| {
-                        if (!stage.trailers.get(trailer).done) {
-                            self.send_request_sync_trailer(
-                                SyncTrailer.requests.get(trailer),
-                                stage.trailers.get(trailer).offset,
-                            );
-                        }
-                    }
-                },
+                .requesting_checkpoint => self.send_request_sync_checkpoint(),
             }
         }
 
@@ -3154,7 +3161,12 @@ pub fn ReplicaType(
                 .checkpoint_client_replies => {
                     self.client_replies.checkpoint(commit_op_checkpoint_client_replies_callback);
                 },
-                .checkpoint_grid_repair => self.commit_op_checkpoint_grid_repair(),
+                .checkpoint_client_sessions => {
+                    self.client_sessions_checkpoint.size =
+                        self.client_sessions.encode(self.client_sessions_checkpoint.buffer);
+                    self.client_sessions_checkpoint.checkpoint(commit_op_checkpoint_client_sessions_callback);
+                },
+                .checkpoint_grid => self.commit_op_checkpoint_grid(),
                 .checkpoint_superblock => self.commit_op_checkpoint_superblock(),
                 .cleanup => self.commit_op_cleanup(),
                 .idle => assert(self.commit_prepare == null),
@@ -3532,25 +3544,50 @@ pub fn ReplicaType(
             const self = @fieldParentPtr(Self, "client_replies", client_replies);
             assert(self.commit_stage == .checkpoint_client_replies);
 
-            self.commit_dispatch(.checkpoint_grid_repair);
+            self.commit_dispatch(.checkpoint_client_sessions);
         }
 
-        fn commit_op_checkpoint_grid_repair(self: *Self) void {
-            assert(self.commit_stage == .checkpoint_grid_repair);
+        fn commit_op_checkpoint_client_sessions_callback(client_sessions_checkpoint: *CheckpointTrailer) void {
+            const self = @fieldParentPtr(Self, "client_sessions_checkpoint", client_sessions_checkpoint);
+            assert(self.commit_stage == .checkpoint_client_sessions);
+
+            self.commit_dispatch(.checkpoint_grid);
+        }
+
+        fn commit_op_checkpoint_grid(self: *Self) void {
+            assert(self.commit_stage == .checkpoint_grid);
             assert(self.commit_prepare.?.header.op == self.op);
 
-            self.grid.checkpoint(commit_op_checkpoint_grid_repair_callback);
+            self.grid.checkpoint(commit_op_checkpoint_grid_callback);
         }
 
-        fn commit_op_checkpoint_grid_repair_callback(grid: *Grid) void {
+        fn commit_op_checkpoint_grid_callback(grid: *Grid) void {
             const self = @fieldParentPtr(Self, "grid", grid);
-            assert(self.commit_stage == .checkpoint_grid_repair);
+            assert(self.commit_stage == .checkpoint_grid);
             assert(self.commit_prepare.?.header.op == self.op);
+            assert(self.grid.free_set.opened);
+            assert(self.grid.free_set.count_released() ==
+                self.grid.free_set_checkpoint.block_count());
+
+            {
+                const checkpoint = &self.client_sessions_checkpoint;
+                var address_previous: u64 = 0;
+                for (checkpoint.block_addresses[0..checkpoint.block_count()]) |address| {
+                    assert(address > 0);
+                    assert(address > address_previous);
+                    address_previous = address;
+                    self.grid.release(address);
+                }
+            }
+            assert(self.grid.free_set.count_released() ==
+                self.grid.free_set_checkpoint.block_count() +
+                self.client_sessions_checkpoint.block_count());
 
             self.commit_dispatch(.checkpoint_superblock);
         }
 
         fn commit_op_checkpoint_superblock(self: *Self) void {
+            assert(self.grid.free_set.opened);
             assert(self.state_machine_opened);
             assert(self.commit_stage == .checkpoint_superblock);
             assert(self.commit_prepare.?.header.op == self.op);
@@ -3586,6 +3623,19 @@ pub fn ReplicaType(
                 }
             };
 
+            const storage_size: u64 = storage_size: {
+                var storage_size = vsr.superblock.data_file_size_min;
+                if (self.grid.free_set.highest_address_acquired()) |address| {
+                    assert(address > 0);
+                    assert(self.grid.free_set_checkpoint.size > 0);
+                    storage_size += address * constants.block_size;
+                } else {
+                    assert(self.grid.free_set_checkpoint.size == 0);
+                    assert(self.grid.free_set.count_released() == 0);
+                }
+                break :storage_size storage_size;
+            };
+
             self.superblock.checkpoint(
                 commit_op_checkpoint_superblock_callback,
                 &self.superblock_context,
@@ -3596,6 +3646,9 @@ pub fn ReplicaType(
                     .sync_op_min = vsr_state_sync_op.min,
                     .sync_op_max = vsr_state_sync_op.max,
                     .manifest_references = self.state_machine.forest.manifest_log.checkpoint_references(),
+                    .free_set_reference = self.grid.free_set_checkpoint.checkpoint_reference(),
+                    .client_sessions_reference = self.client_sessions_checkpoint.checkpoint_reference(),
+                    .storage_size = storage_size,
                 },
             );
         }
@@ -3742,7 +3795,7 @@ pub fn ReplicaType(
             reply.header.* = .{
                 .command = .reply,
                 .operation = prepare.header.operation,
-                .parent = prepare.header.context, // The prepare's context has `request.checksum`.
+                .parent = prepare.header.request_checksum,
                 .client = prepare.header.client,
                 .request = prepare.header.request,
                 .cluster = prepare.header.cluster,
@@ -3765,11 +3818,11 @@ pub fn ReplicaType(
                 // updated with entries for one bar beyond the op_checkpoint.
                 assert(self.op_checkpoint() ==
                     self.superblock.working.vsr_state.checkpoint.commit_min);
-                if (self.client_sessions().get(prepare.header.client)) |entry| {
+                if (self.client_sessions.get(prepare.header.client)) |entry| {
                     assert(entry.header.command == .reply);
                     assert(entry.header.op >= prepare.header.op);
                 } else {
-                    assert(self.client_sessions().count() == self.client_sessions().capacity());
+                    assert(self.client_sessions.count() == self.client_sessions.capacity());
                 }
 
                 log.debug("{}: commit_op: skip client table update: prepare.op={} checkpoint={}", .{
@@ -3848,13 +3901,13 @@ pub fn ReplicaType(
             // we do require that all entries have different commit numbers and are iterated.
             // This ensures that we will always pick the entry with the oldest commit number.
             // We also check that a client has only one entry in the hash map (or it's buggy).
-            const clients = self.client_sessions().count();
+            const clients = self.client_sessions.count();
             assert(clients <= constants.clients_max);
             if (clients == constants.clients_max) {
-                const evictee = self.client_sessions().evictee();
-                self.client_sessions().remove(evictee);
+                const evictee = self.client_sessions.evictee();
+                self.client_sessions.remove(evictee);
 
-                assert(self.client_sessions().count() == constants.clients_max - 1);
+                assert(self.client_sessions.count() == constants.clients_max - 1);
 
                 log.err("{}: client_table_entry_create: clients={}/{} evicting client={}", .{
                     self.replica,
@@ -3873,8 +3926,8 @@ pub fn ReplicaType(
 
             // Any duplicate .register requests should have received the same session number if the
             // client table entry already existed, or been dropped if a session was being committed:
-            const reply_slot = self.client_sessions().put(session, reply.header);
-            assert(self.client_sessions().count() <= constants.clients_max);
+            const reply_slot = self.client_sessions.put(session, reply.header);
+            assert(self.client_sessions.count() <= constants.clients_max);
 
             if (reply.header.size == @sizeOf(Header)) {
                 self.client_replies.remove_reply(reply_slot);
@@ -3891,7 +3944,7 @@ pub fn ReplicaType(
             assert(reply.header.commit > 0);
             assert(reply.header.request > 0);
 
-            if (self.client_sessions().get(reply.header.client)) |entry| {
+            if (self.client_sessions.get(reply.header.client)) |entry| {
                 assert(entry.header.command == .reply);
                 assert(entry.header.op == entry.header.commit);
                 assert(entry.header.commit >= entry.session);
@@ -3913,7 +3966,7 @@ pub fn ReplicaType(
 
                 entry.header = reply.header.*;
 
-                const reply_slot = self.client_sessions().get_slot_for_header(reply.header).?;
+                const reply_slot = self.client_sessions.get_slot_for_header(reply.header).?;
                 if (entry.header.size == @sizeOf(Header)) {
                     self.client_replies.remove_reply(reply_slot);
                 } else {
@@ -3996,10 +4049,8 @@ pub fn ReplicaType(
             // The SV includes headers corresponding to the triggers for preceding
             // checkpoints (as many as we have and can help repair, which is at most 2).
             for ([_]u64{
-                self.op_checkpoint_next_trigger() -|
-                    (constants.journal_slot_count - constants.lsm_batch_multiple),
-                self.op_checkpoint_next_trigger() -|
-                    (constants.journal_slot_count - constants.lsm_batch_multiple) * 2,
+                self.op_checkpoint_next_trigger() -| constants.vsr_checkpoint_interval,
+                self.op_checkpoint_next_trigger() -| constants.vsr_checkpoint_interval * 2,
             }) |op_hook| {
                 if (op > op_hook and op_hook >= op_min) {
                     op = op_hook;
@@ -4316,35 +4367,6 @@ pub fn ReplicaType(
                 });
                 return true;
             }
-
-            // TODO(Async checkpoints): Remove this check.
-            // It is a hack to prevent an availability issue, but it comes at a huge
-            // performance cost.
-            // For an explanation, see: "Cluster: repair: primary checkpoint, backup crash before
-            // checkpoint, primary prepare".
-            if (self.op_checkpoint() != 0 and
-                vsr.Checkpoint.trigger_for_checkpoint(self.op_checkpoint()).? + 1 == self.op)
-            {
-                var count: usize = 0;
-                for (self.sync_target_quorum.candidates, 0..) |target, replica_index| {
-                    if (replica_index == self.replica) {
-                        count += 1; // Count ourselves.
-                    } else {
-                        count += @intFromBool(
-                            target != null and
-                                target.?.checkpoint_op == self.op_checkpoint(),
-                        );
-                    }
-                }
-
-                if (count < self.quorum_replication) {
-                    log.warn("{}: on_request: ignoring (waiting for backups to checkpoint)", .{
-                        self.replica,
-                    });
-                    return true;
-                }
-            }
-
             return false;
         }
 
@@ -4361,7 +4383,7 @@ pub fn ReplicaType(
             assert(message.header.session == 0 or message.header.operation != .register);
             assert(message.header.request == 0 or message.header.operation != .register);
 
-            if (self.client_sessions().get(message.header.client)) |entry| {
+            if (self.client_sessions.get(message.header.client)) |entry| {
                 assert(entry.header.command == .reply);
                 assert(entry.header.client == message.header.client);
 
@@ -4456,7 +4478,7 @@ pub fn ReplicaType(
                 return;
             }
 
-            const slot = self.client_sessions().get_slot_for_client(message.header.client).?;
+            const slot = self.client_sessions.get_slot_for_client(message.header.client).?;
             if (self.client_replies.read_reply_sync(slot, entry)) |reply| {
                 on_request_repeat_reply_callback(
                     &self.client_replies,
@@ -4491,7 +4513,7 @@ pub fn ReplicaType(
             assert(destination_replica == null);
 
             const reply = reply_ orelse {
-                if (self.client_sessions().get_slot_for_header(reply_header)) |slot| {
+                if (self.client_sessions.get_slot_for_header(reply_header)) |slot| {
                     self.client_replies.faulty.set(slot.index);
                 } else {
                     // The read may have been a repair for an older op,
@@ -4580,7 +4602,7 @@ pub fn ReplicaType(
                     .prepare => |pipeline_message_header| {
                         assert(pipeline_message_header.client == message.header.client);
 
-                        if (pipeline_message_header.context == message.header.checksum) {
+                        if (pipeline_message_header.request_checksum == message.header.checksum) {
                             assert(pipeline_message_header.op > self.commit_max);
                             log.debug("{}: on_request: ignoring (already preparing)", .{self.replica});
                             return true;
@@ -4735,12 +4757,11 @@ pub fn ReplicaType(
             return false;
         }
 
-        // TODO Once trailers are removed, this can take a Message.RequestSyncCheckpoint
-        // (or just be inlined into on_request_sync_checkpoint).
-        fn ignore_sync_request_message(self: *const Self, message: *const Message) bool {
-            assert(message.header.command == .request_sync_checkpoint or
-                message.header.command == .request_sync_free_set or
-                message.header.command == .request_sync_client_sessions);
+        fn ignore_request_sync_checkpoint_message(
+            self: *const Self,
+            message: *const Message.RequestSyncCheckpoint,
+        ) bool {
+            assert(message.header.command == .request_sync_checkpoint);
 
             const command = @tagName(message.header.command);
             if (self.replica == message.header.replica) {
@@ -4762,49 +4783,38 @@ pub fn ReplicaType(
                 return true;
             }
 
-            switch (message.header.command) {
-                inline .request_sync_checkpoint,
-                .request_sync_client_sessions,
-                .request_sync_free_set,
-                => |command_comptime| {
-                    const message_header = message.header.into_const(command_comptime).?;
+            if (self.superblock.staging.vsr_state.checkpoint.commit_min != message.header.checkpoint_op) {
+                log.debug("{}: on_{s}: ignoring different checkpoint (local={} message={})", .{
+                    self.replica,
+                    command,
+                    self.op_checkpoint(),
+                    message.header.checkpoint_op,
+                });
+                return true;
+            }
 
-                    if (self.superblock.staging.vsr_state.checkpoint.commit_min != message_header.checkpoint_op) {
-                        log.debug("{}: on_{s}: ignoring different checkpoint (local={} message={})", .{
-                            self.replica,
-                            command,
-                            self.op_checkpoint(),
-                            message_header.checkpoint_op,
-                        });
-                        return true;
-                    }
-
-                    if (self.superblock.staging.checkpoint_id() != message_header.checkpoint_id) {
-                        log.warn("{}: on_{s}: ignoring divergent checkpoint (local={x:0>32} message={x:0>32} remote={})", .{
-                            self.replica,
-                            command,
-                            self.superblock.staging.checkpoint_id(),
-                            message_header.checkpoint_id,
-                            message_header.replica,
-                        });
-                        return true;
-                    }
-                },
-                else => unreachable,
+            if (self.superblock.staging.checkpoint_id() != message.header.checkpoint_id) {
+                log.warn("{}: on_{s}: ignoring divergent checkpoint (local={x:0>32} message={x:0>32} remote={})", .{
+                    self.replica,
+                    command,
+                    self.superblock.staging.checkpoint_id(),
+                    message.header.checkpoint_id,
+                    message.header.replica,
+                });
+                return true;
             }
 
             return false;
         }
 
-        // TODO Once trailers are removed, this can take a Message.SyncCheckpoint
-        // (or just be inlined into on_sync_checkpoint).
-        fn ignore_sync_response_message(self: *const Self, message: *const Message) bool {
-            assert(message.header.command == .sync_checkpoint or
-                message.header.command == .sync_free_set or
-                message.header.command == .sync_client_sessions);
+        fn ignore_sync_checkpoint_message(
+            self: *const Self,
+            message: *const Message.SyncCheckpoint,
+        ) bool {
+            assert(message.header.command == .sync_checkpoint);
             assert(message.header.replica < self.replica_count);
 
-            if (self.syncing != .requesting_trailers) {
+            if (self.syncing != .requesting_checkpoint) {
                 log.debug("{}: on_{s}: ignoring (status={} sync_status={s})", .{
                     self.replica,
                     @tagName(message.header.command),
@@ -4814,33 +4824,27 @@ pub fn ReplicaType(
                 return true;
             }
 
-            const stage: *const SyncStage.RequestingTrailers = &self.syncing.requesting_trailers;
+            const stage: *const SyncStage.RequestingCheckpoint =
+                &self.syncing.requesting_checkpoint;
 
-            switch (message.header.command) {
-                inline .sync_checkpoint, .sync_client_sessions, .sync_free_set => |command| {
-                    const message_header = message.header.into_const(command).?;
+            if (message.header.checkpoint_op != stage.target.checkpoint_op) {
+                log.debug("{}: on_{s}: ignoring, wrong op (got={} want={})", .{
+                    self.replica,
+                    @tagName(message.header.command),
+                    message.header.checkpoint_op,
+                    stage.target.checkpoint_op,
+                });
+                return true;
+            }
 
-                    if (message_header.checkpoint_op != stage.target.checkpoint_op) {
-                        log.debug("{}: on_{s}: ignoring, wrong op (got={} want={})", .{
-                            self.replica,
-                            @tagName(message_header.command),
-                            message_header.checkpoint_op,
-                            stage.target.checkpoint_op,
-                        });
-                        return true;
-                    }
-
-                    if (message_header.checkpoint_id != stage.target.checkpoint_id) {
-                        log.debug("{}: on_{s}: ignoring, wrong op (got={x:0>32} want={x:0>32})", .{
-                            self.replica,
-                            @tagName(message_header.command),
-                            message_header.checkpoint_id,
-                            stage.target.checkpoint_id,
-                        });
-                        return true;
-                    }
-                },
-                else => unreachable,
+            if (message.header.checkpoint_id != stage.target.checkpoint_id) {
+                log.debug("{}: on_{s}: ignoring, wrong op (got={x:0>32} want={x:0>32})", .{
+                    self.replica,
+                    @tagName(message.header.command),
+                    message.header.checkpoint_id,
+                    stage.target.checkpoint_id,
+                });
+                return true;
             }
             return false;
         }
@@ -5019,17 +5023,40 @@ pub fn ReplicaType(
             return vsr.Checkpoint.trigger_for_checkpoint(self.op_checkpoint_next()).?;
         }
 
+        /// Returns checkpoint id associated with the op.
+        ///
+        /// Normally, this is just the id of the checkpoint the op builds on top. However, ops
+        /// between a checkpoint and its trigger can't know checkpoint's id yet, and instead use
+        /// the id of the previous checkpoint.
+        ///
+        /// Returns `null` for ops which are too far in the past/future to know their checkpoint
+        /// ids.
         fn checkpoint_id_for_op(self: *const Self, op: u64) ?u128 {
-            if (self.op_checkpoint() > 0) {
-                if (op < self.op_repair_min()) return null;
+            // Case 1: for the root op, checkpoint id is zero.
+            if (op == 0) return Header.Prepare.root(self.cluster).checkpoint_id;
 
-                const op_checkpoint_next_trigger_previous =
+            if (self.op_checkpoint() > 0) {
+                const op_checkpoint_trigger =
                     vsr.Checkpoint.trigger_for_checkpoint(self.op_checkpoint()).?;
-                if (op <= op_checkpoint_next_trigger_previous) {
+                if (op <= op_checkpoint_trigger) {
+                    if (op + constants.vsr_checkpoint_interval <= op_checkpoint_trigger) {
+                        // Case 2: op is from a too distant past for us to know its checkpoint id.
+                        return null;
+                    }
+                    // Case 3: op is from the previous checkpoint whose id we still remember.
                     return self.superblock.working.vsr_state.checkpoint.previous_checkpoint_id;
                 }
+
+                assert(op + constants.vsr_checkpoint_interval > self.op_checkpoint_next_trigger());
             }
-            return self.superblock.working.checkpoint_id();
+
+            if (op <= self.op_checkpoint_next_trigger()) {
+                // Case 4: op uses the current checkpoint id.
+                return self.superblock.working.checkpoint_id();
+            }
+
+            // Case 5: op is from the too far future for us to know anything!
+            return null;
         }
 
         /// Returns the oldest op that the replica must/(is permitted to) repair.
@@ -5045,8 +5072,9 @@ pub fn ReplicaType(
         ///       nacking the latter entry.
         ///     - there is no guarantee that they will ever be available (if our head is behind),
         ///       and we don't want to stall the new view startup.
-        ///   - primaries do repair checkpointed ops — as many as are guaranteed to exist anywhere in
-        ///     the cluster, so that they can help lagging backups catch up.
+        ///   - primaries do repair checkpointed ops so that they can help lagging backups catch up,
+        ///     as long as the op is new enough to be present in the WAL of some other replica and
+        ///     is from the previous checkpoint.
         ///
         /// When called from status=recovering_head or status=recovering, the caller is responsible
         /// for ensuring that replica.op is valid.
@@ -5060,7 +5088,7 @@ pub fn ReplicaType(
                     assert(self.status == .normal or self.do_view_change_quorum or self.solo());
                     // This is the oldest op that is guaranteed to be in the WALs of any replica.
                     // (Assuming that this primary has not been superseded.)
-                    break :op @min(
+                    const op_wal_oldest = @min(
                         // Add the oldest pipeline_prepare_queue_max ops because they may have been
                         // newer ops which were then truncated by a view-change, causing the head op
                         // to backtrack.
@@ -5068,6 +5096,15 @@ pub fn ReplicaType(
                         // ...But the pipeline messages could not have moved past the checkpoint.
                         self.op_checkpoint_next_trigger(),
                     ) -| (constants.journal_slot_count - 1);
+
+                    // We know checkpoint ids for the current checkpoint and the one before that.
+                    // Don't try repairing ops with older checkpoint_ids which are impossible to
+                    // verify.
+                    const op_with_checkpoint_id_oldest =
+                        (self.op_checkpoint_next_trigger() + 1) -| constants.vsr_checkpoint_interval * 2;
+                    assert(self.checkpoint_id_for_op(op_with_checkpoint_id_oldest) != null);
+
+                    break :op @max(op_wal_oldest, op_with_checkpoint_id_oldest);
                 } else {
                     // Strictly speaking a backup only needs to repair commit_min+1… to proceed.
                     // However, if the backup crashes and recovers, it will need to replay ops
@@ -5087,6 +5124,7 @@ pub fn ReplicaType(
             assert(op <= self.commit_min + 1);
             assert(op <= self.op_checkpoint() + 1);
             assert(self.op - op < constants.journal_slot_count);
+            assert(self.checkpoint_id_for_op(op) != null);
             return op;
         }
 
@@ -5177,7 +5215,8 @@ pub fn ReplicaType(
                 .replica = self.replica,
                 .parent = latest_entry.checksum,
                 .client = request_header.client,
-                .context = request_header.checksum,
+                .request_checksum = request_header.checksum,
+                .checkpoint_id = self.superblock.working.checkpoint_id(),
                 .op = self.op + 1,
                 .commit = self.commit_max,
                 .timestamp = timestamp: {
@@ -5382,8 +5421,8 @@ pub fn ReplicaType(
                 self.repair_prepares();
             } else if (self.client_replies.faulty.findFirstSet()) |slot| {
                 // After we have all prepares, repair replies.
-                const entry = &self.client_sessions().entries[slot];
-                assert(!self.client_sessions().entries_free.isSet(slot));
+                const entry = &self.client_sessions.entries[slot];
+                assert(!self.client_sessions.entries_free.isSet(slot));
                 assert(entry.session != 0);
                 assert(entry.header.size > @sizeOf(Header));
 
@@ -5575,6 +5614,7 @@ pub fn ReplicaType(
                 });
                 return false;
             }
+            assert(header.checkpoint_id == self.checkpoint_id_for_op(header.op).?);
 
             // If we already committed this op, the repair must be the identical message.
             if (self.op_checkpoint() < header.op and header.op <= self.commit_min) {
@@ -6216,7 +6256,7 @@ pub fn ReplicaType(
                     @bitCast(Header.PrepareOk{
                         .command = .prepare_ok,
                         .checkpoint_id = checkpoint_id,
-                        // .parent = header.parent,
+                        .parent = header.parent,
                         .client = header.client,
                         .prepare_checksum = header.checksum,
                         .request = header.request,
@@ -6674,19 +6714,13 @@ pub fn ReplicaType(
                 .block => {
                     assert(!self.standby());
                 },
-                .request_sync_checkpoint,
-                .request_sync_free_set,
-                .request_sync_client_sessions,
-                => {
+                .request_sync_checkpoint => {
                     maybe(self.standby());
                     assert(self.syncing != .idle);
                     assert(message.header.replica == self.replica);
                     assert(message.header.replica != replica);
                 },
-                .sync_checkpoint,
-                .sync_free_set,
-                .sync_client_sessions,
-                => {
+                .sync_checkpoint => {
                     assert(!self.standby());
                     assert(self.syncing == .idle);
                     assert(message.header.replica == self.replica);
@@ -7672,7 +7706,8 @@ pub fn ReplicaType(
                 .next_journal,
                 .setup_client_replies,
                 .checkpoint_client_replies,
-                .checkpoint_grid_repair,
+                .checkpoint_client_sessions,
+                .checkpoint_grid,
                 .checkpoint_superblock,
                 => self.sync_dispatch(.canceling_commit),
 
@@ -7716,12 +7751,12 @@ pub fn ReplicaType(
 
                 // We had a sync target already, but we discovered a newer one.
                 // Re-sync to the new target.
-                .requesting_trailers => |*stage| {
+                .requesting_checkpoint => |*stage| {
                     assert(self.commit_stage == .idle);
                     assert(self.sync_target_max.?.checkpoint_op >= stage.target.checkpoint_op);
                     if (self.sync_target_max.?.checkpoint_op == stage.target.checkpoint_op) return;
 
-                    self.sync_dispatch(.{ .requesting_trailers = .{
+                    self.sync_dispatch(.{ .requesting_checkpoint = .{
                         .target = self.sync_target_max.?,
                     } });
                 },
@@ -7749,7 +7784,8 @@ pub fn ReplicaType(
                         target.checkpoint_id,
                         self.sync_target_max.?.checkpoint_id,
                     });
-                    self.syncing = .{ .requesting_trailers = .{ .target = self.sync_target_max.? } };
+                    self.syncing =
+                        .{ .requesting_checkpoint = .{ .target = self.sync_target_max.? } };
                 }
             }
 
@@ -7762,7 +7798,7 @@ pub fn ReplicaType(
                         (target.checkpoint_op == self.op_checkpoint() and
                         target.checkpoint_id != self.superblock.working.checkpoint_id()))
                     {
-                        self.syncing = .{ .requesting_trailers = .{ .target = target } };
+                        self.syncing = .{ .requesting_checkpoint = .{ .target = target } };
                     }
                 }
             }
@@ -7797,7 +7833,7 @@ pub fn ReplicaType(
                     assert(self.grid.read_global_queue.empty());
                 },
                 .requesting_target => {}, // Waiting for a usable sync target.
-                .requesting_trailers => self.sync_message_timeout.start(),
+                .requesting_checkpoint => self.sync_message_timeout.start(),
                 .updating_superblock => self.sync_superblock_update(),
             }
         }
@@ -7819,7 +7855,8 @@ pub fn ReplicaType(
                 .next_journal,
                 .setup_client_replies,
                 .checkpoint_client_replies,
-                .checkpoint_grid_repair,
+                .checkpoint_client_sessions,
+                .checkpoint_grid,
                 .checkpoint_superblock,
                 => {},
             }
@@ -7863,12 +7900,12 @@ pub fn ReplicaType(
             self.sync_dispatch(.requesting_target);
         }
 
-        fn sync_requesting_trailers_callback(
+        fn sync_requesting_checkpoint_callback(
             self: *Self,
             checkpoint_state: *const vsr.CheckpointState,
         ) void {
             assert(!self.solo());
-            assert(self.syncing == .requesting_trailers);
+            assert(self.syncing == .requesting_checkpoint);
             assert(!self.superblock.updating(.checkpoint));
             assert(self.commit_stage == .idle);
             assert(self.commit_prepare == null);
@@ -7878,19 +7915,19 @@ pub fn ReplicaType(
             assert(self.grid_repair_tables.executing() == 0);
             assert(self.grid_repair_writes.executing() == 0);
             assert(self.grid.blocks_missing.faulty_blocks.count() == 0);
+
             if (self.status == .normal) assert(!self.primary());
 
-            const stage: *const SyncStage.RequestingTrailers = &self.syncing.requesting_trailers;
-            assert(stage.done());
+            const stage: *const SyncStage.RequestingCheckpoint =
+                &self.syncing.requesting_checkpoint;
+            assert(stage.target.checkpoint_id == vsr.checksum(std.mem.asBytes(checkpoint_state)));
 
-            log.debug("{[replica]}: sync_requesting_trailers_callback: " ++
+            log.debug("{[replica]}: sync_requesting_checkpoint_callback: " ++
                 "checkpoint_op={[checkpoint_op]} checkpoint_id={[checkpoint_id]x:0>32} " ++
                 "manifest_oldest_checksum={[manifest_oldest_checksum]} " ++
                 "manifest_oldest_address={[manifest_oldest_address]} " ++
                 "manifest_newest_checksum={[manifest_newest_checksum]} " ++
-                "manifest_newest_address={[manifest_newest_address]} " ++
-                "free_set_checksum={[free_set_checksum]x:0>32} " ++
-                "client_sessions_checksum={[client_sessions_checksum]x:0>32}", .{
+                "manifest_newest_address={[manifest_newest_address]} ", .{
                 .replica = self.replica,
                 .checkpoint_op = stage.target.checkpoint_op,
                 .checkpoint_id = stage.target.checkpoint_id,
@@ -7898,18 +7935,9 @@ pub fn ReplicaType(
                 .manifest_oldest_address = checkpoint_state.manifest_oldest_address,
                 .manifest_newest_checksum = checkpoint_state.manifest_newest_checksum,
                 .manifest_newest_address = checkpoint_state.manifest_newest_address,
-                .free_set_checksum = stage.trailers.get(.free_set).final.?.checksum,
-                .client_sessions_checksum = stage.trailers.get(.client_sessions).final.?.checksum,
             });
 
-            inline for (comptime std.enums.values(vsr.SuperBlockTrailer)) |trailer| {
-                const trailer_size = stage.trailers.get(trailer).final.?.size;
-                @field(self.superblock, @tagName(trailer)).reset();
-                @field(self.superblock, @tagName(trailer)).decode(
-                    self.superblock.trailer_buffer(trailer)[0..trailer_size],
-                );
-            }
-            // Faulty bits will be set in state_machine_open_callback().
+            // Faulty bits will be set in sync_content().
             while (self.client_replies.faulty.findFirstSet()) |slot| {
                 self.client_replies.faulty.unset(slot);
             }
@@ -7936,6 +7964,11 @@ pub fn ReplicaType(
 
             self.state_machine_opened = false;
             self.state_machine.reset();
+
+            self.grid.free_set.reset();
+            self.grid.free_set_checkpoint.reset();
+            self.client_sessions_checkpoint.reset();
+            self.client_sessions.reset();
 
             // Bump commit_max before the superblock update so that a view_durable_update()
             // during the sync_start update uses the correct (new) commit_max.
@@ -8005,7 +8038,7 @@ pub fn ReplicaType(
                 self.transition_to_recovering_head();
             }
 
-            self.state_machine.open(state_machine_open_callback);
+            self.grid.open(grid_open_callback);
             self.sync_dispatch(.idle);
         }
 
@@ -8030,10 +8063,10 @@ pub fn ReplicaType(
             }
 
             for (0..constants.clients_max) |entry_slot| {
-                if (self.superblock.client_sessions.entries_free.isSet(entry_slot)) {
+                if (self.client_sessions.entries_free.isSet(entry_slot)) {
                     assert(!self.client_replies.faulty.isSet(entry_slot));
                 } else {
-                    const entry = &self.superblock.client_sessions.entries[entry_slot];
+                    const entry = &self.client_sessions.entries[entry_slot];
                     if (entry.header.op >= self.superblock.working.vsr_state.sync_op_min and
                         entry.header.op <= self.superblock.working.vsr_state.sync_op_max)
                     {
@@ -8049,9 +8082,9 @@ pub fn ReplicaType(
                 return true;
             } else {
                 for (0..constants.clients_max) |entry_slot| {
-                    if (self.superblock.client_sessions.entries_free.isSet(entry_slot)) continue;
+                    if (self.client_sessions.entries_free.isSet(entry_slot)) continue;
 
-                    const entry = &self.superblock.client_sessions.entries[entry_slot];
+                    const entry = &self.client_sessions.entries[entry_slot];
                     if (entry.header.op >= self.superblock.working.vsr_state.sync_op_min and
                         entry.header.op <= self.superblock.working.vsr_state.sync_op_max)
                     {
@@ -8143,7 +8176,7 @@ pub fn ReplicaType(
 
             if (self.sync_tables) |_| {
                 assert(self.syncing == .idle);
-                assert(self.grid.canceling == null);
+                assert(self.grid.callback != .cancel);
 
                 if (self.grid_repair_tables.available() > 0) {
                     self.sync_enqueue_tables();
@@ -8252,7 +8285,14 @@ pub fn ReplicaType(
                 .prepare, .commit => .normal,
                 // When we are recovering_head we can't participate in a view-change anyway.
                 // But there is a chance that the primary is actually running, despite the DVC/SVC.
-                .do_view_change, .start_view_change => if (self.status == .recovering_head) Status.normal else .view_change,
+                .do_view_change,
+                .start_view_change,
+                // For pings, we don't actually know where the new view is started or not.
+                // Conservatively transition to view change: at worst, we'll send a larger DVC
+                // instead of a RSV.
+                .ping,
+                .pong,
+                => if (self.status == .recovering_head) Status.normal else .view_change,
                 // on_start_view() handles the (possible) transition to view-change manually, before
                 // transitioning to normal.
                 .start_view => return,
@@ -8341,9 +8381,6 @@ pub fn ReplicaType(
             if (header.replica >= self.replica_count) return; // Ignore messages from standbys.
             if (header.replica == self.replica) return; // Ignore messages from self (misdirected).
 
-            // TODO(256-byte headers) Prepares also need to include a checkpoint id,
-            // so that backups cannot diverge by >1 checkpoint when they are (somehow)
-            // partitioned from command=commit and command=ping messages.
             const candidate: SyncTargetCandidate = switch (header.into_any()) {
                 inline .commit,
                 .ping,
@@ -8550,7 +8587,7 @@ pub fn ReplicaType(
 
         fn send_request_blocks(self: *Self) void {
             assert(self.grid_repair_message_timeout.ticking);
-            assert(self.grid.canceling == null);
+            assert(self.grid.callback != .cancel);
             maybe(self.state_machine_opened);
 
             var message = self.message_bus.get_message(.request_blocks);
@@ -8566,7 +8603,7 @@ pub fn ReplicaType(
             if (requests_count == 0) return;
 
             for (requests[0..requests_count]) |*request| {
-                assert(!self.superblock.free_set.is_free(request.block_address));
+                assert(!self.grid.free_set.is_free(request.block_address));
 
                 log.debug("{}: send_request_blocks: request address={} checksum={}", .{
                     self.replica,
@@ -8589,10 +8626,11 @@ pub fn ReplicaType(
 
         fn send_request_sync_checkpoint(self: *Self) void {
             assert(!self.solo());
-            assert(self.syncing == .requesting_trailers);
+            assert(self.syncing == .requesting_checkpoint);
             assert(self.sync_message_timeout.ticking);
 
-            const stage: *const SyncStage.RequestingTrailers = &self.syncing.requesting_trailers;
+            const stage: *const SyncStage.RequestingCheckpoint =
+                &self.syncing.requesting_checkpoint;
 
             self.send_header_to_replica(
                 self.choose_any_other_replica(),
@@ -8631,95 +8669,6 @@ pub fn ReplicaType(
                 std.mem.asBytes(&self.superblock.working.vsr_state.checkpoint),
             );
 
-            reply.header.set_checksum_body(reply.body());
-            reply.header.set_checksum();
-
-            // Note that our checkpoint may not be canonical — that is the syncing replica's
-            // responsibility to check.
-            self.send_message_to_replica(parameters.replica, reply);
-        }
-
-        fn send_request_sync_trailer(self: *Self, comptime command: vsr.Command, offset: u32) void {
-            assert(!self.solo());
-            assert(self.syncing == .requesting_trailers);
-            assert(self.sync_message_timeout.ticking);
-            assert(command == .request_sync_free_set or
-                command == .request_sync_client_sessions);
-            assert(@mod(offset, SyncTrailer.chunk_size_max) == 0);
-
-            const stage: *const SyncStage.RequestingTrailers = &self.syncing.requesting_trailers;
-            const message = self.message_bus.get_message(command);
-            defer self.message_bus.unref(message);
-
-            message.header.* = .{
-                .command = command,
-                .cluster = self.cluster,
-                .replica = self.replica,
-                .size = @sizeOf(Header),
-                .checkpoint_id = stage.target.checkpoint_id,
-                .checkpoint_op = stage.target.checkpoint_op,
-                .trailer_offset = offset,
-            };
-
-            message.header.set_checksum_body(message.body());
-            message.header.set_checksum();
-
-            self.send_message_to_replica(self.choose_any_other_replica(), message);
-        }
-
-        fn send_sync_trailer(self: *Self, comptime command: vsr.Command, parameters: struct {
-            offset: u32,
-            replica: u8,
-        }) void {
-            assert(!self.standby());
-            assert(self.syncing == .idle);
-            assert(self.replica != parameters.replica);
-            assert(command == .request_sync_free_set or
-                command == .request_sync_client_sessions);
-
-            const trailer = comptime for (std.enums.values(vsr.SuperBlockTrailer)) |trailer| {
-                if (command == SyncTrailer.requests.get(trailer)) break trailer;
-            } else unreachable;
-
-            const reply = self.message_bus.get_message(SyncTrailer.responses.get(trailer));
-            defer self.message_bus.unref(reply);
-
-            const trailer_buffer_all = self.superblock.trailer_buffer(trailer);
-            const trailer_checksum = self.superblock.staging.trailer_checksum(trailer);
-            const trailer_size = self.superblock.staging.trailer_size(trailer);
-            assert(trailer_size <= trailer.zone().size_max());
-            assert(trailer_size > parameters.offset or
-                (trailer_size == 0 and parameters.offset == 0));
-
-            const body_size = @as(u32, @intCast(@min(
-                trailer_size - parameters.offset,
-                constants.sync_trailer_message_body_size_max,
-            )));
-            assert(body_size > 0 or parameters.offset == 0);
-            assert(body_size <= constants.message_body_size_max);
-
-            stdx.copy_disjoint(
-                .inexact,
-                u8,
-                reply.buffer[@sizeOf(Header)..],
-                trailer_buffer_all[parameters.offset..][0..body_size],
-            );
-
-            if (constants.verify) {
-                assert(trailer_checksum == vsr.checksum(trailer_buffer_all[0..trailer_size]));
-            }
-
-            reply.header.* = .{
-                .command = SyncTrailer.responses.get(trailer),
-                .cluster = self.cluster,
-                .replica = self.replica,
-                .size = @sizeOf(Header) + body_size,
-                .checkpoint_id = self.superblock.staging.checkpoint_id(),
-                .checkpoint_op = self.op_checkpoint(),
-                .trailer_offset = parameters.offset,
-                .trailer_checksum = trailer_checksum,
-                .trailer_size = trailer_size,
-            };
             reply.header.set_checksum_body(reply.body());
             reply.header.set_checksum();
 
@@ -9135,9 +9084,10 @@ const DVCQuorum = struct {
                 } else {
                     return .complete_invalid;
                 }
-            } else {
-                // This op is eligible to be the view's head.
             }
+
+            // This op is eligible to be the view's head.
+            assert(header_canonical != null and copies > 0);
         } else op_head_max;
         assert(op_head >= op_head_min);
         assert(op_head <= op_head_max);
@@ -9351,7 +9301,7 @@ const PipelineQueue = struct {
             ok.header.prepare_checksum,
         ) orelse return null;
         assert(prepare.message.header.command == .prepare);
-        // assert(prepare.message.header.parent == ok.header.parent);
+        assert(prepare.message.header.parent == ok.header.parent);
         assert(prepare.message.header.client == ok.header.client);
         assert(prepare.message.header.request == ok.header.request);
         assert(prepare.message.header.cluster == ok.header.cluster);
@@ -9362,6 +9312,7 @@ const PipelineQueue = struct {
         assert(prepare.message.header.commit == ok.header.commit);
         assert(prepare.message.header.timestamp == ok.header.timestamp);
         assert(prepare.message.header.operation == ok.header.operation);
+        assert(prepare.message.header.checkpoint_id == ok.header.checkpoint_id);
 
         return prepare;
     }

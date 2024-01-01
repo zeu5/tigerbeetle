@@ -27,7 +27,7 @@ const CliArgs = union(enum) {
 
     start: struct {
         addresses: []const u8,
-        limit_storage: flags.ByteSize = .{ .bytes = constants.storage_size_max },
+        limit_storage: flags.ByteSize = .{ .bytes = constants.storage_size_limit_max },
         cache_accounts: flags.ByteSize = .{ .bytes = constants.cache_accounts_size_default },
         cache_transfers: flags.ByteSize = .{ .bytes = constants.cache_transfers_size_default },
         cache_transfers_posted: flags.ByteSize =
@@ -190,7 +190,7 @@ pub fn parse_args(allocator: std.mem.Allocator) !Command {
     // Skip argv[0] which is the name of this executable
     assert(args.skip());
 
-    const cli_args = flags.parse_commands(&args, CliArgs);
+    const cli_args = flags.parse(&args, CliArgs);
 
     switch (cli_args) {
         .version => |version| {
@@ -239,7 +239,7 @@ pub fn parse_args(allocator: std.mem.Allocator) !Command {
 
             const storage_size_limit = start.limit_storage.bytes;
             const storage_size_limit_min = data_file_size_min;
-            const storage_size_limit_max = constants.storage_size_max;
+            const storage_size_limit_max = constants.storage_size_limit_max;
             if (storage_size_limit > storage_size_limit_max) {
                 flags.fatal("--storage-size-limit: size {} exceeds maximum: {}", .{
                     storage_size_limit,

@@ -32,12 +32,15 @@ const stdx = @import("../stdx.zig");
 
 const SuperBlockType = vsr.SuperBlockType;
 const GridType = @import("../vsr/grid.zig").GridType;
+const BlockPtr = @import("../vsr/grid.zig").BlockPtr;
+const BlockPtrConst = @import("../vsr/grid.zig").BlockPtrConst;
 const allocate_block = @import("../vsr/grid.zig").allocate_block;
 const BlockType = @import("schema.zig").BlockType;
 const tree = @import("tree.zig");
 const RingBuffer = @import("../ring_buffer.zig").RingBuffer;
 const schema = @import("schema.zig");
 const TableInfo = schema.ManifestNode.TableInfo;
+const BlockReference = vsr.BlockReference;
 
 const block_builder_schema = schema.ManifestNode{
     .entry_count = schema.ManifestNode.entry_count_max,
@@ -49,9 +52,6 @@ pub fn ManifestLogType(comptime Storage: type) type {
 
         const SuperBlock = SuperBlockType(Storage);
         const Grid = GridType(Storage);
-
-        const BlockPtr = Grid.BlockPtr;
-        const BlockPtrConst = Grid.BlockPtrConst;
         const Label = schema.ManifestNode.Label;
 
         pub const Callback = *const fn (manifest_log: *ManifestLog) void;
@@ -69,11 +69,6 @@ pub fn ManifestLogType(comptime Storage: type) type {
         pub const TableExtent = struct {
             block: u64, // Manifest block address.
             entry: u32, // Index within the manifest block Label/TableInfo arrays.
-        };
-
-        const BlockReference = struct {
-            checksum: u128,
-            address: u64,
         };
 
         superblock: *SuperBlock,
@@ -346,7 +341,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             );
         }
 
-        fn open_read_block_callback(read: *Grid.Read, block: Grid.BlockPtrConst) void {
+        fn open_read_block_callback(read: *Grid.Read, block: BlockPtrConst) void {
             const manifest_log = @fieldParentPtr(ManifestLog, "read", read);
             assert(!manifest_log.opened);
             assert(manifest_log.reading);

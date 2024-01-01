@@ -42,6 +42,7 @@ test {
     _ = @import("testing/tmp_tigerbeetle.zig");
 
     _ = @import("vsr.zig");
+    _ = @import("vsr/client.zig");
     _ = @import("vsr/clock.zig");
     _ = @import("vsr/checksum.zig");
     _ = @import("vsr/grid_blocks_missing.zig");
@@ -50,7 +51,7 @@ test {
     _ = @import("vsr/replica_format.zig");
     _ = @import("vsr/replica_test.zig");
     _ = @import("vsr/superblock.zig");
-    _ = @import("vsr/superblock_free_set.zig");
+    _ = @import("vsr/free_set.zig");
     _ = @import("vsr/superblock_quorums.zig");
     _ = @import("vsr/sync.zig");
 

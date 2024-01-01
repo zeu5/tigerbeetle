@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.fuzz_vsr_superblock_quorums);
 
 const constants = @import("../constants.zig");
+const vsr = @import("../vsr.zig");
 
 const superblock = @import("./superblock.zig");
 const SuperBlockHeader = superblock.SuperBlockHeader;
@@ -132,7 +133,6 @@ fn test_quorums_working(
         header.* = std.mem.zeroInit(SuperBlockHeader, .{
             .copy = @as(u8, @intCast(i)),
             .version = SuperBlockVersion,
-            .storage_size_max = superblock.data_file_size_min,
             .sequence = copies[i].sequence,
             .parent = checksums[copies[i].sequence - 1],
             .vsr_state = std.mem.zeroInit(SuperBlockHeader.VSRState, .{
@@ -141,6 +141,9 @@ fn test_quorums_working(
                 .replica_count = 6,
                 .checkpoint = std.mem.zeroInit(SuperBlockHeader.CheckpointState, .{
                     .commit_min_checksum = 123,
+                    .free_set_checksum = vsr.checksum(&.{}),
+                    .client_sessions_checksum = vsr.checksum(&.{}),
+                    .storage_size = superblock.data_file_size_min,
                 }),
             }),
         });
@@ -159,7 +162,8 @@ fn test_quorums_working(
                     checksum = random.int(u128);
                 }
             },
-            .invalid_fork => header.storage_size_max += 1, // Ensure we have a different checksum.
+            // Ensure we have a different checksum.
+            .invalid_fork => header.vsr_state.checkpoint.free_set_size += 1,
             .invalid_parent => header.parent += 1,
             .invalid_misdirect => {
                 if (misdirect) {
@@ -277,7 +281,6 @@ pub fn fuzz_quorum_repairs(
             header.* = std.mem.zeroInit(SuperBlockHeader, .{
                 .copy = @as(u8, @intCast(i)),
                 .version = SuperBlockVersion,
-                .storage_size_max = superblock.data_file_size_min,
                 .sequence = 123,
                 .vsr_state = std.mem.zeroInit(SuperBlockHeader.VSRState, .{
                     .replica_id = members[1],

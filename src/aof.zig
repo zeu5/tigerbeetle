@@ -608,10 +608,11 @@ test "aof write / read" {
         .client = 0,
         .request = 0,
         .parent = 0,
-        .context = 0,
+        .request_checksum = 0,
         .cluster = 0,
         .timestamp = 0,
-        .command = vsr.Command.prepare,
+        .checkpoint_id = 0,
+        .command = .prepare,
         .operation = @as(vsr.Operation, @enumFromInt(4)),
         .size = @as(u32, @intCast(@sizeOf(Header) + demo_payload.len)),
     };

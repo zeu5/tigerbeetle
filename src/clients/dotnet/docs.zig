@@ -151,8 +151,7 @@ pub const DotnetDocs = Docs{
     ,
 
     .prerequisites =
-    \\* Any runtime compatible with [.NET Standard 2.1](https://learn.microsoft.com/en-us/dotnet/standard/net-standard?tabs=net-standard-2-1#select-net-standard-version).
-    \\* Optimized for .NET >= 7.0.
+    \\* .NET >= 7.0.
     \\
     \\And if you do not already have NuGet.org as a package
     \\source, make sure to add it:
@@ -246,7 +245,7 @@ pub const DotnetDocs = Docs{
     \\to convert 128-bit little-endian unsigned integers between
     \\`BigInteger`, `byte[]`, and `Guid`.
     \\
-    \\See the class [UInt128Extensions](/src/clients/dotnet/TigerBeetle/UInt128.cs) for more details.
+    \\See the class [UInt128Extensions](/src/clients/dotnet/TigerBeetle/UInt128Extensions.cs) for more details.
     ,
 
     .account_flags_documentation =
@@ -379,6 +378,19 @@ pub const DotnetDocs = Docs{
 
     .lookup_transfers_example =
     \\transfers = client.LookupTransfers(new UInt128[] {1, 2});
+    ,
+
+    .get_account_transfers_example =
+    \\var filter = new GetAccountTransfers 
+    \\{
+    \\  AccountId = 2,
+    \\  Timestamp = 0, // No filter by Timestamp.
+    \\  Limit = 10, // Limit to ten transfers at most.
+    \\  Flags = GetAccountTransfersFlags.Debits | // Include transfer from the debit side.
+    \\      GetAccountTransfersFlags.Credits | // Include transfer from the credit side.
+    \\      GetAccountTransfersFlags.Reversed, // Sort by timestamp in reverse-chronological order.
+    \\};
+    \\transfers = client.GetAccountTransfers(filter);
     ,
 
     .linked_events_example =

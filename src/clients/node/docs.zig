@@ -87,10 +87,7 @@ pub const NodeDocs = Docs{
     \\console.log("Import ok!");
     ,
 
-    .install_commands =
-    \\npm install --prefix ../../
-    \\npm install
-    ,
+    .install_commands = "npm install tigerbeetle-node",
     .build_commands =
     \\npm install typescript @types/node
     \\npx tsc --allowJs --noEmit main.js
@@ -461,6 +458,18 @@ pub const NodeDocs = Docs{
     \\ *   timestamp: 1623062009212508993n,
     \\ * }]
     \\ */
+    ,
+
+    .get_account_transfers_example =
+    \\let filter = {
+    \\  account_id: 2n,
+    \\  timestamp: 0n, // No filter by Timestamp.
+    \\  limit: 10, // Limit to ten transfers at most.
+    \\  flags: GetAccountTransfersFlags.debits | // Include transfer from the debit side.
+    \\    GetAccountTransfersFlags.credits | // Include transfer from the credit side.
+    \\    GetAccountTransfersFlags.reversed, // Sort by timestamp in reverse-chronological order.
+    \\}
+    \\const account_transfers = await client.getAccountTransfers(filter)
     ,
 
     .linked_events_example =

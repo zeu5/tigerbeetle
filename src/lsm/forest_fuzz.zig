@@ -10,17 +10,25 @@ const allocator = fuzz.allocator;
 
 const log = std.log.scoped(.lsm_forest_fuzz);
 const tracer = @import("../tracer.zig");
+const lsm = @import("tree.zig");
+const tb = @import("../tigerbeetle.zig");
 
 const Transfer = @import("../tigerbeetle.zig").Transfer;
 const Account = @import("../tigerbeetle.zig").Account;
 const Storage = @import("../testing/storage.zig").Storage;
 const StateMachine = @import("../state_machine.zig").StateMachineType(Storage, constants.state_machine_config);
+const Reservation = @import("../vsr/free_set.zig").Reservation;
 const GridType = @import("../vsr/grid.zig").GridType;
 const GrooveType = @import("groove.zig").GrooveType;
+const ScanLookupType = @import("../lsm/scan_lookup.zig").ScanLookupType;
+const TimestampRange = @import("timestamp_range.zig").TimestampRange;
+const Direction = @import("../direction.zig").Direction;
 const Forest = StateMachine.Forest;
 
 const Grid = GridType(Storage);
 const SuperBlock = vsr.SuperBlockType(Storage);
+const FreeSet = vsr.FreeSet;
+const CheckpointTrailer = vsr.CheckpointTrailerType(Storage);
 
 pub const tigerbeetle_config = @import("../config.zig").configs.fuzz_min;
 
@@ -35,6 +43,7 @@ const FuzzOpAction = union(enum) {
         account: Account,
     },
     get_account: u128,
+    scan_account: ScanParams,
 };
 const FuzzOpActionTag = std.meta.Tag(FuzzOpAction);
 
@@ -47,6 +56,18 @@ const FuzzOpModifierTag = std.meta.Tag(FuzzOpModifier);
 const FuzzOp = struct {
     action: FuzzOpAction,
     modifier: FuzzOpModifier,
+};
+
+const GrooveAccounts = type: {
+    const forest: Forest = undefined;
+    break :type @TypeOf(forest.grooves.accounts);
+};
+
+const ScanParams = struct {
+    index: std.meta.FieldEnum(GrooveAccounts.IndexTrees),
+    min: u128, // Type-erased field min.
+    max: u128, // Type-erased field max.
+    direction: Direction,
 };
 
 const Environment = struct {
@@ -63,6 +84,9 @@ const Environment = struct {
         .cache_entries_transfers = cache_entries_max,
         .cache_entries_posted = cache_entries_max,
     });
+
+    const free_set_fragments_max = 2048;
+    const free_set_fragment_size = 67;
 
     // We must call compact after every 'batch'.
     // Every `lsm_batch_multiple` batches may put/remove `value_count_max` values per index.
@@ -82,10 +106,12 @@ const Environment = struct {
         init,
         superblock_format,
         superblock_open,
+        free_set_open,
         forest_init,
         forest_open,
         fuzzing,
         forest_compact,
+        grid_checkpoint,
         forest_checkpoint,
         superblock_checkpoint,
     };
@@ -98,13 +124,14 @@ const Environment = struct {
     forest: Forest,
     checkpoint_op: ?u64,
     ticks_remaining: usize,
+    scan_account_buffer: []tb.Account,
 
     fn init(env: *Environment, storage: *Storage) !void {
         env.storage = storage;
 
         env.superblock = try SuperBlock.init(allocator, .{
             .storage = env.storage,
-            .storage_size_limit = constants.storage_size_max,
+            .storage_size_limit = constants.storage_size_limit_max,
         });
 
         env.grid = try Grid.init(allocator, .{
@@ -112,6 +139,11 @@ const Environment = struct {
             .missing_blocks_max = 0,
             .missing_tables_max = 0,
         });
+
+        env.scan_account_buffer = try allocator.alloc(
+            tb.Account,
+            StateMachine.constants.batch_max.create_accounts,
+        );
 
         env.forest = undefined;
         env.checkpoint_op = null;
@@ -121,6 +153,7 @@ const Environment = struct {
     fn deinit(env: *Environment) void {
         env.superblock.deinit(allocator);
         env.grid.deinit(allocator);
+        allocator.free(env.scan_account_buffer);
     }
 
     pub fn run(storage: *Storage, fuzz_ops: []const FuzzOp) !void {
@@ -161,13 +194,39 @@ const Environment = struct {
 
     fn open(env: *Environment) !void {
         env.superblock.open(superblock_open_callback, &env.superblock_context);
-        try env.tick_until_state_change(.superblock_open, .forest_init);
+        try env.tick_until_state_change(.superblock_open, .free_set_open);
+
+        env.grid.open(grid_open_callback);
+        try env.tick_until_state_change(.free_set_open, .forest_init);
 
         env.forest = try Forest.init(allocator, &env.grid, node_count, forest_options);
         env.change_state(.forest_init, .forest_open);
         env.forest.open(forest_open_callback);
 
         try env.tick_until_state_change(.forest_open, .fuzzing);
+
+        if (env.grid.free_set.count_acquired() == 0) {
+            // Only run this once, to avoid acquiring an ever-increasing number of (never
+            // to-be-released) blocks on every restart.
+            env.fragmentate_free_set();
+        }
+    }
+
+    /// Allocate a sparse subset of grid blocks to make sure that the encoded free set needs more
+    /// than one block to exercise the block linked list logic from CheckpointTrailer.
+    fn fragmentate_free_set(env: *Environment) void {
+        assert(env.grid.free_set.count_acquired() == 0);
+
+        var reservations: [free_set_fragments_max]Reservation = undefined;
+        for (&reservations) |*reservation| {
+            reservation.* = env.grid.reserve(free_set_fragment_size).?;
+        }
+        for (reservations) |reservation| {
+            _ = env.grid.free_set.acquire(reservation).?;
+        }
+        for (reservations) |reservation| {
+            env.grid.free_set.forfeit(reservation);
+        }
     }
 
     fn close(env: *Environment) void {
@@ -181,7 +240,12 @@ const Environment = struct {
 
     fn superblock_open_callback(superblock_context: *SuperBlock.Context) void {
         const env = @fieldParentPtr(@This(), "superblock_context", superblock_context);
-        env.change_state(.superblock_open, .forest_init);
+        env.change_state(.superblock_open, .free_set_open);
+    }
+
+    fn grid_open_callback(grid: *Grid) void {
+        const env = @fieldParentPtr(@This(), "grid", grid);
+        env.change_state(.free_set_open, .forest_init);
     }
 
     fn forest_open_callback(forest: *Forest) void {
@@ -206,40 +270,43 @@ const Environment = struct {
 
         env.change_state(.fuzzing, .forest_checkpoint);
         env.forest.checkpoint(forest_checkpoint_callback);
-        try env.tick_until_state_change(.forest_checkpoint, .superblock_checkpoint);
+        try env.tick_until_state_change(.forest_checkpoint, .grid_checkpoint);
+
+        env.grid.checkpoint(grid_checkpoint_callback);
+        try env.tick_until_state_change(.grid_checkpoint, .superblock_checkpoint);
+
+        env.superblock.checkpoint(superblock_checkpoint_callback, &env.superblock_context, .{
+            .manifest_references = env.forest.manifest_log.checkpoint_references(),
+            .free_set_reference = env.grid.free_set_checkpoint.checkpoint_reference(),
+            .client_sessions_reference = .{
+                .last_block_checksum = 0,
+                .last_block_address = 0,
+                .trailer_size = 0,
+                .checksum = vsr.checksum(&.{}),
+            },
+            .commit_min_checksum = env.superblock.working.vsr_state.checkpoint.commit_min_checksum + 1,
+            .commit_min = env.checkpoint_op.?,
+            .commit_max = env.checkpoint_op.? + 1,
+            .sync_op_min = 0,
+            .sync_op_max = 0,
+            .storage_size = vsr.superblock.data_file_size_min +
+                (env.grid.free_set.highest_address_acquired() orelse 0) * constants.block_size,
+        });
         try env.tick_until_state_change(.superblock_checkpoint, .fuzzing);
+
+        env.checkpoint_op = null;
+    }
+
+    fn grid_checkpoint_callback(grid: *Grid) void {
+        const env = @fieldParentPtr(Environment, "grid", grid);
+        assert(env.checkpoint_op != null);
+        env.change_state(.grid_checkpoint, .superblock_checkpoint);
     }
 
     fn forest_checkpoint_callback(forest: *Forest) void {
         const env = @fieldParentPtr(@This(), "forest", forest);
-        const op = env.checkpoint_op.?;
-        env.checkpoint_op = null;
-
-        {
-            // VSRState.monotonic() asserts that the previous_checkpoint id changes.
-            // In a normal replica this is guaranteed – even if the LSM is idle and no blocks
-            // are acquired or released, the client sessions are necessarily mutated.
-            var reply = std.mem.zeroInit(vsr.Header.Reply, .{
-                .cluster = cluster,
-                .command = .reply,
-                .op = op,
-                .commit = op,
-            });
-            reply.set_checksum_body(&.{});
-            reply.set_checksum();
-
-            _ = env.superblock.client_sessions.put(1, &reply);
-        }
-
-        env.change_state(.forest_checkpoint, .superblock_checkpoint);
-        env.superblock.checkpoint(superblock_checkpoint_callback, &env.superblock_context, .{
-            .manifest_references = forest.manifest_log.checkpoint_references(),
-            .commit_min_checksum = env.superblock.working.vsr_state.checkpoint.commit_min_checksum + 1,
-            .commit_min = op,
-            .commit_max = op + 1,
-            .sync_op_min = 0,
-            .sync_op_max = 0,
-        });
+        assert(env.checkpoint_op != null);
+        env.change_state(.forest_checkpoint, .grid_checkpoint);
     }
 
     fn superblock_checkpoint_callback(superblock_context: *SuperBlock.Context) void {
@@ -248,10 +315,6 @@ const Environment = struct {
     }
 
     fn prefetch_account(env: *Environment, id: u128) !void {
-        const groove_accounts = &env.forest.grooves.accounts;
-
-        const GrooveAccounts = @TypeOf(groove_accounts.*);
-
         const Getter = struct {
             _id: u128,
             _groove_accounts: *GrooveAccounts,
@@ -275,7 +338,7 @@ const Environment = struct {
 
         var getter = Getter{
             ._id = id,
-            ._groove_accounts = groove_accounts,
+            ._groove_accounts = &env.forest.grooves.accounts,
         };
         getter.prefetch_start();
         while (!getter.finished) {
@@ -296,6 +359,71 @@ const Environment = struct {
     fn get_account(env: *Environment, id: u128) ?*const Account {
         const account = env.forest.grooves.accounts.get(id) orelse return null;
         return account;
+    }
+
+    const Scanner = struct {
+        const AccountsScanLookup = ScanLookupType(GrooveAccounts, Storage);
+        scan_lookup: AccountsScanLookup = undefined,
+        result: ?[]const tb.Account = null,
+
+        fn scan_lookup_callback(scan_lookup: *AccountsScanLookup) void {
+            const scanner = @fieldParentPtr(Scanner, "scan_lookup", scan_lookup);
+            assert(scanner.result == null);
+            scanner.result = scan_lookup.slice();
+        }
+
+        fn scan(
+            self: *Scanner,
+            comptime index: std.meta.FieldEnum(GrooveAccounts.IndexTrees),
+            env: *Environment,
+            params: ScanParams,
+        ) !void {
+            const Tree = std.meta.fieldInfo(GrooveAccounts.IndexTrees, index).type;
+            const Prefix = std.meta.fieldInfo(Tree.Table.Value, .field).type;
+
+            var min: Prefix = @intCast(params.min);
+            var max: Prefix = @intCast(params.max);
+            assert(min <= max);
+
+            const scan_buffer_pool = &env.forest.scan_buffer_pool;
+            const groove_accounts = &env.forest.grooves.accounts;
+            const scan_builder = &groove_accounts.scan_builder;
+            defer {
+                scan_buffer_pool.reset();
+                scan_builder.reset();
+            }
+
+            // It's not expected to exceed `lsm_scans_max` here.
+            const scan_buffer = scan_buffer_pool.acquire() catch unreachable;
+
+            // TODO: add support for timestamp ranges.
+            const scan_range = scan_builder.scan_range(
+                index,
+                scan_buffer,
+                lsm.snapshot_latest,
+                .{ .field = min, .timestamp = 0 },
+                .{ .field = max, .timestamp = std.math.maxInt(u63) },
+                params.direction,
+            );
+
+            self.scan_lookup = AccountsScanLookup.init(groove_accounts, scan_range);
+            self.scan_lookup.read(env.scan_account_buffer, &scan_lookup_callback);
+
+            while (self.result == null) {
+                if (env.ticks_remaining == 0) return error.OutOfTicks;
+                env.ticks_remaining -= 1;
+                env.storage.tick();
+            }
+        }
+    };
+
+    fn scan_accounts(env: *Environment, params: ScanParams) ![]const tb.Account {
+        var scanner: Scanner = .{};
+        try switch (params.index) {
+            inline else => |field| scanner.scan(field, env, params),
+        };
+
+        return scanner.result.?;
     }
 
     // The forest should behave like a simple key-value data-structure.
@@ -481,13 +609,70 @@ const Environment = struct {
                     assert(stdx.equal_bytes(Account, &model_account.?, lsm_account.?));
                 }
             },
+            .scan_account => |params| {
+                const accounts = try env.scan_accounts(params);
+
+                var timestamp_last: ?u64 = null;
+                var prefix_last: ?u128 = null;
+
+                // Asserting the positive space:
+                // all objects found by the scan must exist in our model.
+                for (accounts) |account| {
+                    const model_account = model.get_account(account.id).?;
+                    assert(model_account.id == account.id);
+                    assert(model_account.user_data_128 == account.user_data_128);
+                    assert(model_account.user_data_64 == account.user_data_64);
+                    assert(model_account.user_data_32 == account.user_data_32);
+                    assert(model_account.timestamp == account.timestamp);
+                    assert(model_account.ledger == account.ledger);
+                    assert(model_account.code == account.code);
+                    assert(std.meta.eql(model_account.flags, account.flags));
+
+                    if (params.min == params.max) {
+                        // If exact match (min == max), it's expected to be sorted by timestamp.
+                        if (timestamp_last) |timestamp| {
+                            switch (params.direction) {
+                                .ascending => assert(account.timestamp > timestamp),
+                                .descending => assert(account.timestamp < timestamp),
+                            }
+                        }
+                        timestamp_last = account.timestamp;
+                    } else {
+                        // If not exact, it's expected to be sorted by prefix and then timestamp.
+                        const prefix_current: u128 = switch (params.index) {
+                            inline else => |field| @field(account, @tagName(field)),
+                        };
+
+                        if (prefix_last) |prefix| {
+                            // If range (between min .. max), it's expected to be sorted by prefix.
+                            switch (params.direction) {
+                                .ascending => assert(prefix_current >= prefix),
+                                .descending => assert(prefix_current <= prefix),
+                            }
+
+                            if (prefix_current == prefix) {
+                                if (timestamp_last) |timestamp| {
+                                    switch (params.direction) {
+                                        .ascending => assert(account.timestamp > timestamp),
+                                        .descending => assert(account.timestamp < timestamp),
+                                    }
+                                }
+                                timestamp_last = account.timestamp;
+                            } else {
+                                timestamp_last = null;
+                            }
+                        }
+                        prefix_last = prefix_current;
+                    }
+                }
+            },
         }
     }
 };
 
 pub fn run_fuzz_ops(storage_options: Storage.Options, fuzz_ops: []const FuzzOp) !void {
     // Init mocked storage.
-    var storage = try Storage.init(allocator, constants.storage_size_max, storage_options);
+    var storage = try Storage.init(allocator, constants.storage_size_limit_max, storage_options);
     defer storage.deinit(allocator);
 
     try Environment.run(&storage, fuzz_ops);
@@ -517,6 +702,8 @@ pub fn generate_fuzz_ops(random: std.rand.Random, fuzz_op_count: usize) ![]const
         .put_account = constants.lsm_batch_multiple * 2,
         // Maybe do some gets.
         .get_account = if (random.boolean()) 0 else constants.lsm_batch_multiple,
+        // Maybe do some scans.
+        .scan_account = if (random.boolean()) 0 else constants.lsm_batch_multiple,
     };
     log.info("action_distribution = {:.2}", .{action_distribution});
 
@@ -600,11 +787,41 @@ pub fn generate_fuzz_ops(random: std.rand.Random, fuzz_op_count: usize) ![]const
                 } };
             },
             .get_account => FuzzOpAction{ .get_account = random_id(random, u128) },
+            .scan_account => blk: {
+                @setEvalBranchQuota(10_000);
+                const Index = std.meta.FieldEnum(GrooveAccounts.IndexTrees);
+                const index = random.enumValue(Index);
+                break :blk switch (index) {
+                    inline else => |field| {
+                        const FieldType = std.meta.fieldInfo(
+                            tb.Account,
+                            comptime std.meta.stringToEnum(
+                                std.meta.FieldEnum(tb.Account),
+                                @tagName(field),
+                            ).?,
+                        ).type;
+                        var min = random_id(random, FieldType);
+                        var max = if (random.boolean()) min else random_id(random, FieldType);
+                        if (min > max) std.mem.swap(FieldType, &min, &max);
+                        assert(min <= max);
+
+                        break :blk FuzzOpAction{
+                            .scan_account = .{
+                                .index = index,
+                                .min = min,
+                                .max = max,
+                                .direction = random.enumValue(Direction),
+                            },
+                        };
+                    },
+                };
+            },
         };
         switch (action) {
             .compact => puts_since_compact = 0,
             .put_account => puts_since_compact += 1,
             .get_account => {},
+            .scan_account => {},
         }
         // TODO(jamii)
         // Currently, crashing is only interesting during a compact.

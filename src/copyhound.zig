@@ -4,7 +4,7 @@
 //!
 //! To get a file with IR, use `-femit-llvm-ir` cli argument for `zig build-exe` or
 //!
-//!     $ zig build -Doptimize=ReleaseSafe -Demit-llvm-ir
+//!     $ zig build -Drelease -Demit-llvm-ir
 //!
 //! Pass the resulting .ll file to copyhound on stdin.
 //!
@@ -54,7 +54,7 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(allocator);
     assert(args.skip());
 
-    const cli_args = flags.parse_commands(&args, CliArgs);
+    const cli_args = flags.parse(&args, CliArgs);
 
     var line_buffer = try allocator.alloc(u8, 1024 * 1024);
     var func_buf = try allocator.alloc(u8, 4096);

@@ -12,8 +12,7 @@ The TigerBeetle client for .NET.
 
 Linux >= 5.6 is the only production environment we
 support. But for ease of development we also support macOS and Windows.
-* Any runtime compatible with [.NET Standard 2.1](https://learn.microsoft.com/en-us/dotnet/standard/net-standard?tabs=net-standard-2-1#select-net-standard-version).
-* Optimized for .NET >= 7.0.
+* .NET >= 7.0.
 
 And if you do not already have NuGet.org as a package
 source, make sure to add it:
@@ -135,7 +134,7 @@ account balances have a few extension methods to make it easier
 to convert 128-bit little-endian unsigned integers between
 `BigInteger`, `byte[]`, and `Guid`.
 
-See the class [UInt128Extensions](/src/clients/dotnet/TigerBeetle/UInt128.cs) for more details.
+See the class [UInt128Extensions](/src/clients/dotnet/TigerBeetle/UInt128Extensions.cs) for more details.
 
 ### Account Flags
 
@@ -374,6 +373,30 @@ the same as the order of `id`s in the request. You can refer to the
 
 ```cs
 transfers = client.LookupTransfers(new UInt128[] {1, 2});
+```
+
+## Get Account Transfers
+
+NOTE: This is a preview API that is subject to breaking changes once we have
+a stable querying API.
+
+Fetches the transfers involving a given account, allowing basic filter and pagination
+capabilities.
+
+The transfers in the response are sorted by `timestamp` in chronological or
+reverse-chronological order.
+
+```cs
+var filter = new GetAccountTransfers 
+{
+  AccountId = 2,
+  Timestamp = 0, // No filter by Timestamp.
+  Limit = 10, // Limit to ten transfers at most.
+  Flags = GetAccountTransfersFlags.Debits | // Include transfer from the debit side.
+      GetAccountTransfersFlags.Credits | // Include transfer from the credit side.
+      GetAccountTransfersFlags.Reversed, // Sort by timestamp in reverse-chronological order.
+};
+transfers = client.GetAccountTransfers(filter);
 ```
 
 ## Linked Events

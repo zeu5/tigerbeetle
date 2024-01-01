@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) !void {
         }
     } else @panic("error: unsupported target");
 
-    const mode = b.standardOptimizeOption(.{});
+    const mode = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
     const emit_llvm_ir = b.option(bool, "emit-llvm-ir", "Emit LLVM IR (.ll file)") orelse false;
 
     const options = b.addOptions();
@@ -61,7 +61,13 @@ pub fn build(b: *std.Build) !void {
     defer shell.destroy();
 
     // The "tigerbeetle version" command includes the build-time commit hash.
-    options.addOption([]const u8, "git_commit", try shell.git_commit());
+    const git_commit = b.option(
+        []const u8,
+        "git-commit",
+        "The git commit revision of the source code.",
+    ) orelse try shell.git_commit();
+    options.addOption([]const u8, "git_commit", git_commit);
+
     options.addOption(
         []const u8,
         "version",
@@ -161,6 +167,13 @@ pub fn build(b: *std.Build) !void {
         benchmark.addModule("vsr", vsr_module);
         benchmark.addModule("vsr_options", vsr_options_module);
         link_tracer_backend(benchmark, git_clone_tracy, tracer_backend, target);
+
+        const install_step = b.addInstallArtifact(benchmark, .{});
+        const build_step = b.step(
+            "build_benchmark",
+            "Build TigerBeetle benchmark",
+        );
+        build_step.dependOn(&install_step.step);
 
         const run_cmd = b.addRunArtifact(benchmark);
         if (b.args) |args| run_cmd.addArgs(args);
@@ -400,17 +413,6 @@ pub fn build(b: *std.Build) !void {
             mode,
             target,
         );
-
-        const ci_exe = b.addExecutable(.{
-            .name = "ci",
-            .root_source_file = .{ .path = "src/scripts/ci.zig" },
-            .target = target,
-            .main_pkg_path = .{ .path = "src" },
-        });
-        const ci_run = b.addRunArtifact(ci_exe);
-        if (b.args) |args| ci_run.addArgs(args);
-        const ci_step = b.step("ci", "Run CI checks");
-        ci_step.dependOn(&ci_run.step);
     }
 
     {
@@ -597,9 +599,9 @@ pub fn build(b: *std.Build) !void {
             .description = "Fuzz the SuperBlock. Args: [--seed <seed>] [--events-max <count>]",
         },
         .{
-            .name = "fuzz_vsr_superblock_free_set",
-            .file = "src/vsr/superblock_free_set_fuzz.zig",
-            .description = "Fuzz the SuperBlock FreeSet. Args: [--seed <seed>]",
+            .name = "fuzz_vsr_free_set",
+            .file = "src/vsr/free_set_fuzz.zig",
+            .description = "Fuzz the FreeSet. Args: [--seed <seed>]",
         },
         .{
             .name = "fuzz_vsr_superblock_quorums",
@@ -666,16 +668,16 @@ pub fn build(b: *std.Build) !void {
         step.dependOn(&run_cmd.step);
     }
 
-    const release_exe = b.addExecutable(.{
-        .name = "release",
-        .root_source_file = .{ .path = "src/scripts/release.zig" },
+    const scripts_exe = b.addExecutable(.{
+        .name = "scripts",
+        .root_source_file = .{ .path = "src/scripts/main.zig" },
         .target = target,
         .main_pkg_path = .{ .path = "src" },
     });
-    const release_exe_run = b.addRunArtifact(release_exe);
-    if (b.args) |args| release_exe_run.addArgs(args);
-    const release_step = b.step("release", "build and publish release artifacts");
-    release_step.dependOn(&release_exe_run.step);
+    const scripts_run = b.addRunArtifact(scripts_exe);
+    if (b.args) |args| scripts_run.addArgs(args);
+    const scripts_step = b.step("scripts", "Run automation scripts");
+    scripts_step.dependOn(&scripts_run.step);
 }
 
 fn link_tracer_backend(

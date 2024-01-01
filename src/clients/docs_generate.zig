@@ -349,6 +349,7 @@ const Generator = struct {
             self.language.create_transfers_example,
             self.language.create_transfers_errors_example,
             self.language.lookup_transfers_example,
+            self.language.get_account_transfers_example,
             self.language.no_batch_example,
             self.language.batch_example,
             self.language.transfer_flags_link_example,
@@ -657,6 +658,19 @@ const Generator = struct {
         );
         mw.code(language.markdown_name, language.lookup_transfers_example);
 
+        mw.header(2, "Get Account Transfers");
+        mw.paragraph(
+            \\NOTE: This is a preview API that is subject to breaking changes once we have
+            \\a stable querying API.
+            \\
+            \\Fetches the transfers involving a given account, allowing basic filter and pagination
+            \\capabilities.
+            \\
+            \\The transfers in the response are sorted by `timestamp` in chronological or
+            \\reverse-chronological order.
+        );
+        mw.code(language.markdown_name, language.get_account_transfers_example);
+
         mw.header(2, "Linked Events");
         mw.paragraph(
             \\When the `linked` flag is specified for an account when creating accounts or
@@ -817,7 +831,7 @@ pub fn main() !void {
 
     assert(args.skip());
 
-    const cli_args = flags.parse_flags(&args, CliArgs);
+    const cli_args = flags.parse(&args, CliArgs);
 
     if (cli_args.validate != null and cli_args.no_validate) {
         flags.fatal("--validate: conflicts with --no-validate", .{});

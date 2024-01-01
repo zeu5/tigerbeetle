@@ -26,7 +26,7 @@ const Shell = @import("../shell.zig");
 
 const Language = enum { dotnet, go, java, node, zig, docker };
 const LanguageSet = std.enums.EnumSet(Language);
-const CliArgs = struct {
+pub const CliArgs = struct {
     version: []const u8,
     sha: []const u8,
     language: ?Language = null,
@@ -39,27 +39,8 @@ const VersionInfo = struct {
     sha: []const u8,
 };
 
-pub fn main() !void {
-    var gpa_allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    defer switch (gpa_allocator.deinit()) {
-        .ok => {},
-        .leak => fatal("memory leak", .{}),
-    };
-
-    const gpa = gpa_allocator.allocator();
-    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
-    defer arena_allocator.deinit();
-
-    const shell = try Shell.create(gpa);
-    defer shell.destroy();
-
-    var args = try std.process.argsWithAllocator(gpa);
-    defer args.deinit();
-
-    // Discard executable name.
-    _ = args.next().?;
-
-    const cli_args = flags.parse_flags(&args, CliArgs);
+pub fn main(shell: *Shell, gpa: std.mem.Allocator, cli_args: CliArgs) !void {
+    _ = gpa;
 
     const languages = if (cli_args.language) |language|
         LanguageSet.initOne(language)
@@ -163,11 +144,13 @@ fn build_tigerbeetle(shell: *Shell, info: VersionInfo, dist_dir: std.fs.Dir) !vo
             try shell.zig(
                 \\build install
                 \\    -Dtarget={target}
-                \\    -Doptimize={mode}
+                \\    -Drelease={release}
+                \\    -Dgit-commit={commit}
                 \\    -Dversion={version}
             , .{
                 .target = target,
-                .mode = if (debug) "Debug" else "ReleaseSafe",
+                .release = if (debug) "false" else "true",
+                .commit = info.sha,
                 .version = info.version,
             });
 
@@ -237,7 +220,7 @@ fn build_go(shell: *Shell, info: VersionInfo, dist_dir: std.fs.Dir) !void {
     try shell.pushd("./src/clients/go");
     defer shell.popd();
 
-    try shell.zig("build go_client -Doptimize=ReleaseSafe -Dconfig=production", .{});
+    try shell.zig("build go_client -Drelease -Dconfig=production", .{});
 
     const files = try shell.exec_stdout("git ls-files", .{});
     var files_lines = std.mem.tokenize(u8, files, "\n");
@@ -390,7 +373,7 @@ fn publish(shell: *Shell, languages: LanguageSet, info: VersionInfo) !void {
         });
 
         try shell.exec(
-            \\gh release create --draft --prerelease
+            \\gh release create --draft
             \\  --notes {notes}
             \\  {tag}
         , .{
@@ -428,7 +411,7 @@ fn publish(shell: *Shell, languages: LanguageSet, info: VersionInfo) !void {
 
     if (languages.contains(.zig)) {
         try shell.exec(
-            \\gh release edit --draft=false
+            \\gh release edit --draft=false --latest=true
             \\  {tag}
         , .{ .tag = info.version });
     }

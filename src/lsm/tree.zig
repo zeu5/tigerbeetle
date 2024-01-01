@@ -19,6 +19,9 @@ const schema = @import("schema.zig");
 const CompositeKeyType = @import("composite_key.zig").CompositeKeyType;
 const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_size, 16);
 const RingBuffer = @import("../ring_buffer.zig").RingBuffer;
+const GridType = @import("../vsr/grid.zig").GridType;
+const BlockPtrConst = @import("../vsr/grid.zig").BlockPtrConst;
+
 pub const ScopeCloseMode = enum { persist, discard };
 const snapshot_min_for_table_output = @import("compaction.zig").snapshot_min_for_table_output;
 
@@ -92,7 +95,7 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
         pub const TableMemory = @import("table_memory.zig").TableMemoryType(Table);
         pub const Manifest = @import("manifest.zig").ManifestType(Table, Storage);
 
-        const Grid = @import("../vsr/grid.zig").GridType(Storage);
+        const Grid = GridType(Storage);
         const ManifestLog = @import("manifest_log.zig").ManifestLogType(Storage);
         const KeyRange = Manifest.KeyRange;
 
@@ -296,9 +299,11 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
         /// This function is intended to never be called by regular code. It only
         /// exists for fuzzing, due to the performance overhead it carries. Real
         /// code must rely on the Groove cache for lookups.
+        /// The returned Value pointer is only valid synchronously.
         pub fn lookup_from_memory(tree: *Tree, key: Key) ?*const Value {
-            assert(constants.verify);
+            comptime assert(constants.verify);
 
+            tree.table_mutable.sort();
             return tree.table_mutable.get(key) orelse tree.table_immutable.get(key);
         }
 
@@ -312,6 +317,7 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
         /// could contain the key synchronously from the Grid cache. It then attempts to ascertain
         /// the existence of the key in the data block. If any of the blocks needed to
         /// ascertain the existence of the key are not in the Grid cache, it bails out.
+        /// The returned `.positive` Value pointer is only valid synchronously.
         pub fn lookup_from_levels_cache(tree: *Tree, snapshot: u64, key: Key) LookupMemoryResult {
             var iterator = tree.manifest.lookup(snapshot, key, 0);
             while (iterator.next()) |table| {
@@ -368,7 +374,8 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
             }
         }
 
-        /// Call this function only after checking `lookup_from_memory()`.
+        /// Call this function only after checking `lookup_from_levels_cache()`.
+        /// The callback's Value pointer is only valid synchronously within the callback.
         pub fn lookup_from_levels_storage(tree: *Tree, parameters: struct {
             callback: *const fn (*LookupContext, ?*const Value) void,
             context: *LookupContext,
@@ -415,7 +422,6 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
 
         pub const LookupContext = struct {
             const Read = Grid.Read;
-            const BlockPtrConst = Grid.BlockPtrConst;
 
             tree: *Tree,
             completion: Read,
@@ -1011,42 +1017,6 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
             if (constants.verify) {
                 tree.manifest.assert_no_invisible_tables(&.{});
             }
-        }
-
-        pub const RangeQuery = union(enum) {
-            bounded: struct {
-                start: Key,
-                end: Key,
-            },
-            open: struct {
-                start: Key,
-                order: enum {
-                    ascending,
-                    descending,
-                },
-            },
-        };
-
-        pub const RangeQueryIterator = struct {
-            tree: *Tree,
-            snapshot: u64,
-            query: RangeQuery,
-
-            pub fn next(callback: *const fn (result: ?Value) void) void {
-                _ = callback;
-            }
-        };
-
-        pub fn range_query(
-            tree: *Tree,
-            /// The snapshot timestamp, if any
-            snapshot: ?u64,
-            query: RangeQuery,
-        ) RangeQueryIterator {
-            _ = tree;
-            _ = snapshot;
-            _ = query;
-            @panic("unimplemented");
         }
     };
 }

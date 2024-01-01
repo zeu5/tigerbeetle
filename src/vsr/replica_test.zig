@@ -194,7 +194,7 @@ test "Cluster: recovery: grid corruption (disjoint)" {
         t.replica(.R2),
     }, 0..) |replica, i| {
         var address: u64 = 1 + i; // Addresses start at 1.
-        while (address <= vsr.superblock.grid_blocks_max) : (address += 3) {
+        while (address <= Storage.grid_blocks_max) : (address += 3) {
             // Leave every third address un-corrupt.
             // Each block exists intact on exactly one replica.
             replica.corrupt(.{ .grid_block = address + 1 });
@@ -697,14 +697,23 @@ test "Cluster: repair: ack committed prepare" {
     try expectEqual(b1.op_head(), 21);
     try expectEqual(b2.op_head(), 20);
 
+    try expectEqual(p.status(), .normal);
+    try expectEqual(b1.status(), .normal);
+    try expectEqual(b2.status(), .normal);
+
     // Change views. B1/B2 participate. Don't allow B2 to repair op=21.
     t.replica(.R_).pass(.R_, .bidirectional, .start_view_change);
     t.replica(.R_).pass(.R_, .bidirectional, .do_view_change);
     p.drop(.__, .bidirectional, .prepare);
     p.drop(.__, .bidirectional, .do_view_change);
+    p.drop(.__, .bidirectional, .start_view_change);
     t.run();
     try expectEqual(b1.commit(), 20);
     try expectEqual(b2.commit(), 20);
+
+    try expectEqual(p.status(), .normal);
+    try expectEqual(b1.status(), .normal);
+    try expectEqual(b2.status(), .normal);
 
     // But other than that, heal A0/B1, but partition B2 completely.
     // (Prevent another view change.)
@@ -715,8 +724,14 @@ test "Cluster: repair: ack committed prepare" {
     t.replica(.R_).drop(.R_, .bidirectional, .do_view_change);
     t.run();
 
+    try expectEqual(p.status(), .normal);
+    try expectEqual(b1.status(), .normal);
+    try expectEqual(b2.status(), .normal);
+
     // A0 acks op=21 even though it already committed it.
+    try expectEqual(p.commit(), 21);
     try expectEqual(b1.commit(), 21);
+    try expectEqual(b2.commit(), 20);
 }
 
 test "Cluster: repair: primary checkpoint, backup crash before checkpoint, primary prepare" {
@@ -726,7 +741,9 @@ test "Cluster: repair: primary checkpoint, backup crash before checkpoint, prima
     // 4. A0 commits a checkpoint trigger and checkpoints.
     // 5. B1 crashes before it can commit the trigger or checkpoint.
     // 6. A0 prepares a message.
-    // 7. B1 restarts. The very first entry in its WAL is corrupt, but A0 has already overwritten the corresponding entry in its own WAL.
+    // 7. B1 restarts. The very first entry in its WAL is corrupt.
+    // A0 has *not* already overwritten the corresponding entry in its own WAL, thanks to the
+    // pipeline component of the vsr_checkpoint_interval.
     const t = try TestContext.init(.{ .replica_count = 3 });
     defer t.deinit();
 
@@ -820,6 +837,57 @@ test "Cluster: view-change: DVC, 2/3 faulty header stall" {
     try expectEqual(t.replica(.R_).status(), .view_change);
 }
 
+test "Cluster: view-change: duel of the primaries" {
+    // In a cluster of 3, one replica gets partitioned away, and the remaining two _both_ become
+    // primaries (for different views). Additionally, the primary from the  higher view is
+    // abdicating. The primaries should figure out that they need to view-change to a higher view.
+    const t = try TestContext.init(.{ .replica_count = 3 });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(20, 20);
+    try expectEqual(t.replica(.R_).commit(), 20);
+
+    try expectEqual(t.replica(.R_).view(), 1);
+    try expectEqual(t.replica(.R1).role(), .primary);
+
+    t.replica(.R2).drop_all(.R_, .bidirectional);
+    t.replica(.R1).drop(.R_, .outgoing, .commit);
+    try c.request(21, 21);
+
+    try expectEqual(t.replica(.R0).commit_max(), 20);
+    try expectEqual(t.replica(.R1).commit_max(), 21);
+    try expectEqual(t.replica(.R2).commit_max(), 20);
+
+    t.replica(.R0).pass_all(.R_, .bidirectional);
+    t.replica(.R2).pass_all(.R_, .bidirectional);
+    t.replica(.R1).drop_all(.R_, .bidirectional);
+    t.replica(.R2).drop(.R0, .bidirectional, .prepare_ok);
+    t.replica(.R2).drop(.R0, .outgoing, .do_view_change);
+    t.run();
+
+    // The stage is set: we have two primaries in different views, R2 is about to abdicate.
+    try expectEqual(t.replica(.R1).view(), 1);
+    try expectEqual(t.replica(.R1).status(), .normal);
+    try expectEqual(t.replica(.R1).role(), .primary);
+    try expectEqual(t.replica(.R1).commit(), 21);
+    try expectEqual(t.replica(.R2).op_head(), 21);
+
+    try expectEqual(t.replica(.R2).view(), 2);
+    try expectEqual(t.replica(.R2).status(), .normal);
+    try expectEqual(t.replica(.R2).role(), .primary);
+    try expectEqual(t.replica(.R2).commit(), 20);
+    try expectEqual(t.replica(.R2).op_head(), 21);
+
+    t.replica(.R1).pass_all(.R_, .bidirectional);
+    t.replica(.R2).pass_all(.R_, .bidirectional);
+    t.replica(.R0).drop_all(.R_, .bidirectional);
+    t.run();
+
+    try expectEqual(t.replica(.R1).commit(), 21);
+    try expectEqual(t.replica(.R2).commit(), 21);
+}
+
 test "Cluster: sync: partition, lag, sync (transition from idle)" {
     for ([_]u64{
         // Normal case: the cluster has committed atop the checkpoint trigger.
@@ -866,23 +934,23 @@ test "Cluster: sync: sync, bump target, sync" {
     defer t.deinit();
 
     var c = t.clients(0, t.cluster.clients.len);
-    try c.request(20, 20);
-    try expectEqual(t.replica(.R_).commit(), 20);
+    try c.request(16, 16);
+    try expectEqual(t.replica(.R_).commit(), 16);
 
     t.replica(.R2).drop_all(.R_, .bidirectional);
     try c.request(checkpoint_2_trigger, checkpoint_2_trigger);
 
-    // Allow R2 to complete SyncStage.requesting_trailers, but get stuck
-    // during SyncStage.requesting_trailers.
+    // Allow R2 to complete SyncStage.requesting_target, but get stuck
+    // during SyncStage.requesting_checkpoint.
     t.replica(.R2).pass_all(.R_, .bidirectional);
     t.replica(.R2).drop(.R_, .outgoing, .request_sync_checkpoint);
     t.run();
-    try expectEqual(t.replica(.R2).sync_status(), .requesting_trailers);
+    try expectEqual(t.replica(.R2).sync_status(), .requesting_checkpoint);
     try expectEqual(t.replica(.R2).sync_target_checkpoint_op(), checkpoint_2);
 
     // R2 discovers the newer sync target and restarts sync.
     try c.request(checkpoint_3_trigger, checkpoint_3_trigger);
-    try expectEqual(t.replica(.R2).sync_status(), .requesting_trailers);
+    try expectEqual(t.replica(.R2).sync_status(), .requesting_checkpoint);
     try expectEqual(t.replica(.R2).sync_target_checkpoint_op(), checkpoint_3);
 
     t.replica(.R2).pass(.R_, .bidirectional, .request_sync_checkpoint);
@@ -974,7 +1042,7 @@ test "Cluster: sync: checkpoint diverges, sync (primary diverges)" {
 
     // A0 has learned about B1/B2's canonical checkpoint — a checkpoint with the same op,
     // but a different identifier.
-    try expectEqual(a0.sync_status(), .requesting_trailers);
+    try expectEqual(a0.sync_status(), .requesting_checkpoint);
     try expectEqual(a0.sync_target_checkpoint_op(), checkpoint_2);
     try expectEqual(a0.sync_target_checkpoint_op(), t.replica(.R_).op_checkpoint());
     try expectEqual(a0.sync_target_checkpoint_id(), b1.op_checkpoint_id());
@@ -1072,7 +1140,7 @@ const TestContext = struct {
             .replica_count = options.replica_count,
             .standby_count = options.standby_count,
             .client_count = options.client_count,
-            .storage_size_limit = vsr.sector_floor(constants.storage_size_max),
+            .storage_size_limit = vsr.sector_floor(constants.storage_size_limit_max),
             .seed = random.int(u64),
             .network = .{
                 .node_count = options.replica_count + options.standby_count,
@@ -1136,8 +1204,7 @@ const TestContext = struct {
 
     pub fn clients(t: *TestContext, index: usize, count: usize) TestClients {
         var client_indexes = stdx.BoundedArray(usize, constants.clients_max){};
-        var i = index;
-        while (i < index + count) : (i += 1) client_indexes.append_assume_capacity(i);
+        for (index..index + count) |i| client_indexes.append_assume_capacity(i);
         return TestClients{
             .context = t,
             .cluster = t.cluster,
@@ -1298,6 +1365,10 @@ const TestReplicas = struct {
 
     pub fn commit(t: *const TestReplicas) u64 {
         return t.get(.commit_min);
+    }
+
+    pub fn commit_max(t: *const TestReplicas) u64 {
+        return t.get(.commit_max);
     }
 
     pub fn state_machine_opened(t: *const TestReplicas) bool {

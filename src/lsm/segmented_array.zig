@@ -9,7 +9,7 @@ const stdx = @import("../stdx.zig");
 const div_ceil = @import("../stdx.zig").div_ceil;
 const binary_search_values_upsert_index = @import("binary_search.zig").binary_search_values_upsert_index;
 const binary_search_keys = @import("binary_search.zig").binary_search_keys;
-const Direction = @import("direction.zig").Direction;
+const Direction = @import("../direction.zig").Direction;
 
 /// A "segmented array" is an array with efficient (amortized) random-insert/remove operations.
 /// Also known as an "unrolled linked list": https://en.wikipedia.org/wiki/Unrolled_linked_list
@@ -1027,7 +1027,10 @@ fn TestContext(
                 }
             }
 
-            try context.remove_all();
+            // Rarely, the code above won't generate an insert at all.
+            if (context.inserts > 0) {
+                try context.remove_all();
+            }
 
             if (element_order == .unsorted) {
                 // Insert at the beginning of the array until the array is full.

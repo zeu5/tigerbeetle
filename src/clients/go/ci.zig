@@ -11,10 +11,8 @@ const TmpTigerBeetle = @import("../../testing/tmp_tigerbeetle.zig");
 pub fn tests(shell: *Shell, gpa: std.mem.Allocator) !void {
     assert(shell.file_exists("go.mod"));
 
-    // No unit tests for Go :-(
-
     // `go build`  won't compile the native library automatically, we need to do that ourselves.
-    try shell.zig("build go_client -Doptimize=ReleaseSafe -Dconfig=production", .{});
+    try shell.zig("build go_client -Drelease -Dconfig=production", .{});
 
     // Although we have compiled the TigerBeetle client library, we still need `cgo` to link it with
     // our resulting Go binary. Strictly speaking, `CC` is controlled by the users of TigerBeetle,
@@ -31,6 +29,10 @@ pub fn tests(shell: *Shell, gpa: std.mem.Allocator) !void {
         );
         break :cc try shell.print("{s} cc", .{zig_exe});
     };
+
+    // Building the server before running the integrated tests:
+    try shell.zig("build install -Drelease -Dconfig=production", .{});
+    try shell.exec("go test", .{});
 
     inline for (.{ "basic", "two-phase", "two-phase-many" }) |sample| {
         try shell.pushd("./samples/" ++ sample);

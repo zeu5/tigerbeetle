@@ -77,6 +77,7 @@ const ConfigProcess = struct {
     verify: bool,
     port: u16 = 3001,
     address: []const u8 = "127.0.0.1",
+    storage_size_limit_max: u64 = 16 * 1024 * 1024 * 1024 * 1024,
     memory_size_max_default: u64 = 1024 * 1024 * 1024,
     cache_accounts_size_default: usize,
     cache_transfers_size_default: usize,
@@ -116,8 +117,6 @@ const ConfigProcess = struct {
     grid_missing_tables_max: usize = 3,
     aof_record: bool = false,
     aof_recovery: bool = false,
-    /// When null, this defaults to message_body_size_max.
-    sync_trailer_message_body_size_max: ?usize = null,
 };
 
 /// Configurations which are tunable per-cluster.
@@ -136,13 +135,17 @@ const ConfigCluster = struct {
     journal_slot_count: usize = 1024,
     message_size_max: usize = 1 * 1024 * 1024,
     superblock_copies: comptime_int = 4,
-    storage_size_max: u64 = 16 * 1024 * 1024 * 1024 * 1024,
     block_size: comptime_int = 1024 * 1024,
     lsm_levels: u6 = 7,
     lsm_growth_factor: u32 = 8,
     lsm_batch_multiple: comptime_int = 32,
     lsm_snapshots_max: usize = 32,
     lsm_manifest_compact_extra_blocks: comptime_int = 1,
+
+    // Arbitrary value.
+    // TODO(batiati): Maybe this constant should be derived from `grid_iops_read_max`,
+    // since each scan can read from `lsm_levels` in parallel.
+    lsm_scans_max: comptime_int = 8,
 
     /// The WAL requires at least two sectors of redundant headers — otherwise we could lose them all to
     /// a single torn write. A replica needs at least one valid redundant header to determine an
@@ -237,6 +240,7 @@ pub const configs = struct {
     /// Not suitable for production, but good for testing code that would be otherwise hard to reach.
     pub const test_min = Config{
         .process = .{
+            .storage_size_limit_max = 200 * 1024 * 1024,
             .direct_io = false,
             .direct_io_required = false,
             .cache_accounts_size_default = @sizeOf(vsr.tigerbeetle.Account) * 2048,
@@ -247,8 +251,6 @@ pub const configs = struct {
             .grid_missing_blocks_max = 3,
             .grid_missing_tables_max = 2,
             .verify = true,
-            // Set to a small value to ensure the multipart trailer sync is easily tested.
-            .sync_trailer_message_body_size_max = 129,
         },
         .cluster = .{
             .clients_max = 4 + 3,
@@ -256,7 +258,6 @@ pub const configs = struct {
             .view_change_headers_suffix_max = 4 + 1,
             .journal_slot_count = Config.Cluster.journal_slot_count_min,
             .message_size_max = Config.Cluster.message_size_max_min(4),
-            .storage_size_max = 200 * 1024 * 1024,
 
             .block_size = sector_size,
             .lsm_batch_multiple = 4,
@@ -270,7 +271,7 @@ pub const configs = struct {
     /// able to max out the LSM levels.
     pub const fuzz_min = config: {
         var base = test_min;
-        base.cluster.storage_size_max = 1 * 1024 * 1024 * 1024;
+        base.process.storage_size_limit_max = 1 * 1024 * 1024 * 1024;
         break :config base;
     };
 

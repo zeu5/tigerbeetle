@@ -448,7 +448,6 @@ pub fn ReplType(comptime MessageBus: type) type {
                 },
                 .help => {
                     try repl.display_help();
-                    std.os.exit(0);
                 },
 
                 .create_accounts,
@@ -685,24 +684,23 @@ pub fn ReplType(comptime MessageBus: type) type {
                 return;
             }
 
-            const message = repl.client.get_message();
-            errdefer repl.client.release(message);
+            const batch = repl.client.batch_get(operation, switch (operation) {
+                inline else => |op| @divExact(arguments.len, @sizeOf(StateMachine.Event(op))),
+            }) catch unreachable;
 
             stdx.copy_disjoint(
-                .inexact,
+                .exact,
                 u8,
-                message.buffer[@sizeOf(vsr.Header)..],
+                batch.slice(),
                 arguments,
             );
 
             repl.request_done = false;
             try repl.debug("Sending command: {}.\n", .{operation});
-            repl.client.request(
+            repl.client.batch_submit(
                 @as(u128, @intCast(@intFromPtr(repl))),
                 client_request_callback,
-                operation,
-                message,
-                arguments.len,
+                batch,
             );
         }
 
@@ -831,6 +829,7 @@ pub fn ReplType(comptime MessageBus: type) type {
                         }
                     }
                 },
+                .get_account_transfers => unreachable,
             }
         }
 
