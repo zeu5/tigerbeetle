@@ -534,6 +534,30 @@ pub fn build(b: *std.Build) !void {
     }
 
     {
+        const alt_simulator = b.addExecutable(.{
+            .name = "alt_simulator",
+            .root_source_file = .{ .path = "src/alt_simulator.zig" },
+            .target = target,
+            .optimize = if (b.args != null) mode else .ReleaseSafe,
+        });
+        // Ensure that we get stack traces even in release builds.
+        alt_simulator.omit_frame_pointer = false;
+        alt_simulator.addOptions("vsr_options", options);
+        link_tracer_backend(alt_simulator, git_clone_tracy, tracer_backend, target);
+
+        const run_cmd = b.addRunArtifact(alt_simulator);
+
+        if (b.args) |args| run_cmd.addArgs(args);
+
+        const install_step = b.addInstallArtifact(alt_simulator, .{});
+        const build_step = b.step("alt_simulator", "Build the Simulator");
+        build_step.dependOn(&install_step.step);
+
+        const run_step = b.step("alt_simulator_run", "Run the Simulator");
+        run_step.dependOn(&run_cmd.step);
+    }
+
+    {
         const vopr = b.addExecutable(.{
             .name = "vopr",
             .root_source_file = .{ .path = "src/vopr.zig" },
