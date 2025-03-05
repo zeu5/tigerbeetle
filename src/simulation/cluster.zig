@@ -392,7 +392,6 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             for (cluster.storages) |*storage| storage.deinit(cluster.allocator);
             for (cluster.aofs) |*aof| aof.deinit(cluster.allocator);
 
-            cluster.storage_fault_atlas.deinit(cluster.allocator);
             cluster.grid_checker.deinit(); // (Storage references this.)
 
             cluster.allocator.free(cluster.clients);
@@ -407,7 +406,6 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             cluster.allocator.free(cluster.aofs);
             cluster.allocator.free(cluster.releases_bundled);
             cluster.allocator.destroy(cluster.grid_checker);
-            cluster.allocator.destroy(cluster.storage_fault_atlas);
             cluster.allocator.destroy(cluster.network);
             cluster.allocator.destroy(cluster);
         }

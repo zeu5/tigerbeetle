@@ -3,8 +3,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const vsr = @import("../../vsr.zig");
-const constants = @import("../../constants.zig");
+const vsr = @import("../vsr.zig");
+const constants = @import("../constants.zig");
 
 pub fn ManifestCheckerType(comptime Forest: type) type {
     return struct {

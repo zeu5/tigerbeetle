@@ -22,7 +22,7 @@ pub fn NetworkSimulator(comptime Packet: type) type {
         const Self = @This();
 
         const LinkPacket = struct {
-            expiry: u64,
+            path: Path,
             callback: *const fn (packet: Packet, path: Path) void,
             packet: Packet,
         };
@@ -50,10 +50,10 @@ pub fn NetworkSimulator(comptime Packet: type) type {
             self.links.deinit();
         }
 
-        pub fn add_link(self: *Self, process_id: u32) !void {
+        pub fn add_link(self: *Self, process_id: u32) void {
             if (!self.links.contains(process_id)) {
-                const packet_queue = try std.ArrayList(*Message).init(self.allocator);
-                try self.links.put(process_id, packet_queue);
+                const packet_queue = std.ArrayList(*Message).init(self.allocator);
+                self.links.put(process_id, packet_queue);
             }
         }
 
@@ -62,9 +62,16 @@ pub fn NetworkSimulator(comptime Packet: type) type {
             packet: Packet, // Callee owned.
             callback: *const fn (packet: Packet, path: Path) void,
             path: Path,
-        ) !void {
+        ) void {
+            if (!self.links.contains(path.target)) {
+                self.add_link(path.target);
+            }
             var packet_queue = try self.links.get(path.target);
-            try packet_queue.append(LinkPacket{ .callback = callback, .packet = packet, .path = path });
+            packet_queue.append(LinkPacket{
+                .callback = callback,
+                .packet = packet,
+                .path = path,
+            });
         }
 
         pub fn tick(self: *Self) void {
@@ -81,7 +88,7 @@ pub fn NetworkSimulator(comptime Packet: type) type {
                 for (packet_queue.items) |packet| {
                     packet.callback(packet.packet, packet.path);
                 }
-                packet_queue.clear();
+                packet_queue.clearRetainingCapacity();
             }
         }
 

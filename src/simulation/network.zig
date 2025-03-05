@@ -1,18 +1,3 @@
-// Network type
-// 1. link(process, message_bus)
-// 2. init(allocator: mem.Allocator, options: Options) !Network
-// 3. deinit(network: *Network, allocator: mem.Allocator) void
-// 4. tick(network: *Network) void
-// 5. process_disable(process: Process) void
-// 6. get_message_bus(process: Process) *MessageBus
-// 7. process_enable(process: Process) void
-// 8. send_message(message, path)
-
-// pub const Path = struct {
-//     source: Process,
-//     target: Process,
-// };
-
 const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;

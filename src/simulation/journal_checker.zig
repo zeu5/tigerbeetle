@@ -3,10 +3,10 @@ const std = @import("std");
 const assert = std.debug.assert;
 const log = std.log.scoped(.journal_checker);
 
-const constants = @import("../../constants.zig");
-const stdx = @import("../../stdx.zig");
-const vsr = @import("../../vsr.zig");
-const TestStorage = @import("../storage.zig").Storage;
+const constants = @import("../constants.zig");
+const stdx = @import("../stdx.zig");
+const vsr = @import("../vsr.zig");
+const TestStorage = @import("storage.zig").Storage;
 
 pub fn JournalCheckerType(comptime Replica: type) type {
     return struct {

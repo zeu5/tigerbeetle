@@ -26,9 +26,7 @@ const constants = @import("../constants.zig");
 const stdx = @import("../stdx.zig");
 const vsr = @import("../vsr.zig");
 const schema = @import("../lsm/schema.zig");
-const StorageType = @import("../storage.zig").StorageType;
-const IO = @import("../io.zig").IO;
-const Storage = StorageType(IO);
+const Storage = @import("storage.zig").Storage;
 
 /// After each compaction bar, save the cumulative hash of all acquired grid blocks.
 /// (Excluding the open manifest log block, if any.)
