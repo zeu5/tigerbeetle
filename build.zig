@@ -89,6 +89,8 @@ pub fn build(b: *std.Build) !void {
         .test_unit = b.step("test:unit", "Run unit tests"),
         .test_unit_build = b.step("test:unit:build", "Build unit tests"),
         .test_jni = b.step("test:jni", "Run Java JNI tests"),
+        .simulator_build = b.step("simulator:build", "Build the simulator"),
+        .simulator_run = b.step("simulator", "Run the simulator"),
         .vopr = b.step("vopr", "Run the VOPR"),
         .vopr_build = b.step("vopr:build", "Build the VOPR"),
     };
@@ -231,6 +233,15 @@ pub fn build(b: *std.Build) !void {
     try build_test_jni(b, build_steps.test_jni, .{
         .target = target,
         .mode = mode,
+    });
+
+    build_simulator(b, .{
+        .simulator_build = build_steps.simulator_build,
+        .simulator_run = build_steps.simulator_run,
+    }, .{
+        .vsr_options = vsr_options,
+        .target = target,
+        .print_exe = build_options.print_exe,
     });
 
     // zig build vopr -- 42
@@ -810,6 +821,27 @@ fn build_test_jni(
     }
 
     step_test_jni.dependOn(&b.addRunArtifact(tests).step);
+}
+
+fn build_simulator(b: *std.Build, steps: struct {
+    simulator_build: *std.Build.Step,
+    simulator_run: *std.Build.Step,
+}, options: struct {
+    vsr_options: *std.Build.Step.Options,
+    target: std.Build.ResolvedTarget,
+    print_exe: bool,
+}) void {
+    const simulator = b.addExecutable(.{
+        .name = "simulator",
+        .root_source_file = b.path("src/simulator.zig"),
+        .target = options.target,
+    });
+    simulator.root_module.addOptions("vsr_options", options.vsr_options);
+    steps.simulator_build.dependOn(print_or_install(b, simulator, options.print_exe));
+
+    const run_cmd = b.addRunArtifact(simulator);
+    if (b.args) |args| run_cmd.addArgs(args);
+    steps.simulator_run.dependOn(&run_cmd.step);
 }
 
 fn build_vopr(
