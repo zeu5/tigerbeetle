@@ -33,16 +33,23 @@ const NetworkSimulatorPath = @import("network_simulator.zig").Path;
 
 const log = std.log.scoped(.network);
 
-pub const NetworkOptions = struct { node_count: u8, client_count: u8, seed: u64, simulation_options: NetworkSimulatorOptions };
+pub const NetworkOptions = struct {
+    node_count: u8,
+    client_count: u8,
+    seed: u64,
+    simulation_options: NetworkSimulatorOptions,
+    path_maximum_capacity: u8,
+    recorded_count_max: u8,
+};
+
 pub const Path = struct {
     source: Process,
     target: Process,
 };
 
 pub const Network = struct {
-    const Self = @This();
     pub const Packet = struct {
-        network: *Self,
+        network: *Network,
         message: *Message,
 
         pub fn clone(packet: *const Packet) Packet {
@@ -77,6 +84,7 @@ pub const Network = struct {
     processes: std.ArrayListUnmanaged(u128),
     /// A pool of messages that are in the network (sent, but not yet delivered).
     message_pool: MessagePool,
+    options: NetworkOptions,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -94,7 +102,7 @@ pub const Network = struct {
         errdefer processes.deinit(allocator);
 
         var packet_simulator = try NetworkSimulator(Packet).init(allocator, options.simulation_options);
-        errdefer packet_simulator.deinit(allocator);
+        errdefer packet_simulator.deinit();
 
         // Count:
         // - replica → replica paths (excluding self-loops)
@@ -128,7 +136,7 @@ pub const Network = struct {
         network.buses.deinit(network.allocator);
         network.buses_enabled.deinit(network.allocator);
         network.processes.deinit(network.allocator);
-        network.network_simulator.deinit(network.allocator);
+        network.network_simulator.deinit();
         network.message_pool.deinit(network.allocator);
     }
 

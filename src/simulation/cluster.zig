@@ -9,8 +9,8 @@ const constants = @import("../constants.zig");
 const message_pool = @import("../message_pool.zig");
 const MessagePool = message_pool.MessagePool;
 const Message = MessagePool.Message;
-const MessageBusType = @import("message_bus.zig").MessageBusType;
-const NetworkType = @import("network.zig").NetworkType;
+const MessageBus = @import("message_bus.zig").MessageBus;
+const Network = @import("network.zig").Network;
 const NetworkOptions = @import("network.zig").NetworkOptions;
 const vsr = @import("../vsr.zig");
 const IdPermutation = @import("id.zig").IdPermutation;
@@ -48,18 +48,15 @@ pub const Failure = enum(u8) {
 /// with a replica index.
 const client_id_permutation_shift = constants.members_max;
 
-pub fn ClusterType(comptime StateMachineType: anytype, comptime NetworkSimulatorType: anytype) type {
+pub fn ClusterType(comptime StateMachineType: anytype) type {
     return struct {
         const Cluster = @This();
-
-        pub const MessageBus = MessageBusType(NetworkSimulatorType);
         pub const StateMachine = StateMachineType(Storage, constants.state_machine_config);
         pub const Replica = vsr.ReplicaType(StateMachine, MessageBus, Storage, TimePointer, AOF);
         pub const Client = vsr.ClientType(StateMachine, MessageBus, Time);
         pub const StateChecker = StateCheckerType(Client, Replica);
         pub const ManifestChecker = ManifestCheckerType(StateMachine.Forest);
         pub const JournalChecker = JournalCheckerType(Replica);
-        pub const Network = NetworkType(NetworkSimulatorType);
 
         pub const Options = struct {
             cluster_id: u128,

@@ -22,7 +22,7 @@ const Header = vsr.Header;
 const StateMachineType = @import("state_machine.zig").StateMachineType;
 const SimpleSimulatorType = @import("network_simulator.zig").SimpleSimulatorType;
 
-const Cluster = @import("cluster.zig").ClusterType(StateMachineType, SimpleSimulatorType);
+const Cluster = @import("cluster.zig").ClusterType(StateMachineType);
 const StateMachine = Cluster.StateMachine;
 const Message = @import("../message_pool.zig").MessagePool.Message;
 const ReplySequence = @import("../testing/reply_sequence.zig").ReplySequence;

@@ -5,10 +5,9 @@ const constants = @import("./constants.zig");
 const Header = vsr.Header;
 
 const StateMachineType = @import("simulation/state_machine.zig").StateMachineType;
-const SimpleSimulatorType = @import("simulation/network_simulator.zig").SimpleSimulatorType;
 const StateMachine = Cluster.StateMachine;
 
-const Cluster = @import("simulation/cluster.zig").ClusterType(StateMachineType, SimpleSimulatorType);
+const Cluster = @import("simulation/cluster.zig").ClusterType(StateMachineType);
 const Orchestrator = @import("simulation/orchestrator.zig").Orchestrator;
 const Release = @import("simulation/cluster.zig").Release;
 
@@ -83,7 +82,9 @@ pub fn main() !void {
         .seed = random.int(u64),
         .releases = &releases,
         .client_release = releases[0].release,
-        .network = .{ .node_count = node_count, .client_count = client_count, .seed = random.int(u64), .path_maximum_capacity = 2, .recorded_count_max = 0 },
+        .network = .{ .node_count = node_count, .client_count = client_count, .seed = random.int(u64), .path_maximum_capacity = 2, .recorded_count_max = 0, .simulation_options = .{
+            .simulation_type = .Simple,
+        } },
         .storage = .{
             .read_latency_min = 0,
             .read_latency_mean = 0,

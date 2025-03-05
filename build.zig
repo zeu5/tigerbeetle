@@ -235,6 +235,7 @@ pub fn build(b: *std.Build) !void {
         .mode = mode,
     });
 
+    // zig build simulator
     build_simulator(b, .{
         .simulator_build = build_steps.simulator_build,
         .simulator_run = build_steps.simulator_run,
