@@ -8,9 +8,16 @@ pub const Path = struct {
     target: u8,
 };
 
-pub fn NetworkSimulator(comptime Packet: type, comptime SimulatorType: anytype) type {
-    const Simulator = SimulatorType(Packet);
+pub const SimulationType = enum {
+    Simple,
+    Guided,
+};
 
+pub const SimulatorOptions = struct {
+    simulation_type: SimulationType,
+};
+
+pub fn NetworkSimulator(comptime Packet: type) type {
     return struct {
         const Self = @This();
 
@@ -20,33 +27,32 @@ pub fn NetworkSimulator(comptime Packet: type, comptime SimulatorType: anytype) 
             packet: Packet,
         };
 
+        allocator: std.mem.Allocator,
+
         links: *std.AutoHashMap(u32, std.ArrayList(LinkPacket)),
-        simulator_ticker: Simulator,
+        options: SimulatorOptions,
 
-        pub fn init(allocator: std.mem.Allocator) !Self {
-            var simulator_ticker = try Simulator.init(allocator);
-            errdefer simulator_ticker.deinit();
-
+        pub fn init(allocator: std.mem.Allocator, options: SimulatorOptions) !Self {
             var links = std.AutoHashMap(u32, std.ArrayList(LinkPacket)).init(allocator);
 
             return Self{
+                .allocator = allocator,
                 .links = &links,
-                .simulator_ticker = simulator_ticker,
+                .options = options,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            const allocator = std.heap.page_allocator;
             var it = self.links.iterator();
             while (it.next()) |entry| {
-                entry.value.deinit(allocator);
+                entry.value_ptr.deinit();
             }
             self.links.deinit();
         }
 
         pub fn add_link(self: *Self, process_id: u32) !void {
             if (!self.links.contains(process_id)) {
-                const packet_queue = try std.ArrayList(*Message).init(std.heap.page_allocator);
+                const packet_queue = try std.ArrayList(*Message).init(self.allocator);
                 try self.links.put(process_id, packet_queue);
             }
         }
@@ -62,34 +68,26 @@ pub fn NetworkSimulator(comptime Packet: type, comptime SimulatorType: anytype) 
         }
 
         pub fn tick(self: *Self) void {
-            self.simulator_ticker.tick(self.links);
-        }
-    };
-}
-
-// Delivers all packets to their destinations.
-pub fn SimpleSimulatorType(comptime LinkPacket: type) type {
-    return struct {
-        const Self = @This();
-
-        pub fn init(allocator: std.mem.Allocator) !Self {
-            _ = allocator;
-            return Self{};
+            switch (self.options.simulation_type) {
+                SimulationType.Simple => self.tick_simple(),
+                SimulationType.Guided => self.tick_guided(),
+            }
         }
 
-        pub fn deinit(self: *Self) void {
-            _ = self;
-        }
-
-        pub fn tick(links: *std.AutoHashMap(u32, std.ArrayList(LinkPacket))) void {
-            var it = links.iterator();
+        pub fn tick_simple(self: *Self) void {
+            var it = self.links.iterator();
             while (it.next()) |entry| {
-                const packet_queue = entry.value;
+                const packet_queue = entry.value_ptr;
                 for (packet_queue.items) |packet| {
                     packet.callback(packet.packet, packet.path);
                 }
                 packet_queue.clear();
             }
+        }
+
+        pub fn tick_guided(self: *Self) void {
+            _ = self;
+            // TODO
         }
     };
 }

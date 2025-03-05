@@ -14,9 +14,11 @@ pub const Process = union(ProcessType) {
 };
 
 pub fn MessageBusType(comptime NetworkSimulatorType: anytype) type {
+    const Network = NetworkType(NetworkSimulatorType);
+
     return struct {
         const MessageBus = @This();
-        network: *NetworkType(NetworkSimulatorType),
+        network: *Network,
         pool: *MessagePool,
 
         cluster: u128,
@@ -26,7 +28,7 @@ pub fn MessageBusType(comptime NetworkSimulatorType: anytype) type {
         on_message_callback: *const fn (message_bus: *MessageBus, message: *Message) void,
 
         pub const Options = struct {
-            network: *NetworkType,
+            network: *Network,
         };
 
         pub fn init(

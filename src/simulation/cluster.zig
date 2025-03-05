@@ -15,10 +15,10 @@ const NetworkOptions = @import("network.zig").NetworkOptions;
 const vsr = @import("../vsr.zig");
 const IdPermutation = @import("id.zig").IdPermutation;
 
-const AOF = @import("../aof.zig").AOF;
+const AOF = @import("../testing/aof.zig").AOF;
 const IO = @import("../io.zig").IO;
 const Storage = @import("storage.zig").Storage;
-const Time = @import("../time.zig").Time;
+const Time = @import("../testing/time.zig").Time;
 const SuperBlock = vsr.SuperBlockType(Storage);
 
 const StorageChecker = @import("storage_checker.zig").StorageChecker;
