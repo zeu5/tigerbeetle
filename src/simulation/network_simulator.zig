@@ -66,7 +66,7 @@ pub fn NetworkSimulator(comptime Packet: type) type {
             if (!self.links.contains(path.target)) {
                 self.add_link(path.target);
             }
-            var packet_queue = try self.links.get(path.target);
+            var packet_queue = self.links.get(path.target);
             packet_queue.append(LinkPacket{
                 .callback = callback,
                 .packet = packet,
