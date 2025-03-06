@@ -10,15 +10,18 @@ const StateMachine = Cluster.StateMachine;
 const Cluster = @import("simulation/cluster.zig").ClusterType(StateMachineType);
 const Orchestrator = @import("simulation/orchestrator.zig").Orchestrator;
 const Release = @import("simulation/cluster.zig").Release;
+const message_trace_recorder = @import("simulation/message_trace_recorder.zig");
+const MessageTraceRecorder = message_trace_recorder.MessageTraceRecorder;
 
 const CLIArgs = struct {
-    // "lite" mode runs a small cluster and only looks for crashes.
-    lite: bool = false,
-    ticks_max_requests: u32 = 40_000_000,
-    ticks_max_convergence: u32 = 10_000_000,
+    ticks_max_requests: u32 = 1000,
     positional: struct {
         seed: ?[]const u8 = null,
     },
+};
+
+pub const std_options = .{
+    .log_level = .info,
 };
 
 const releases = [_]Release{
@@ -67,11 +70,14 @@ pub fn main() !void {
 
     const MiB = 1024 * 1024;
     const storage_size_limit = vsr.sector_floor(
-        200 * MiB,
+        2048 * MiB,
     );
 
     const cluster_id = 0;
     const standby_count = 0;
+
+    const trace_file_path = "trace.json";
+    var trace_recorder = try MessageTraceRecorder.init(allocator, trace_file_path);
 
     const cluster_options = Cluster.Options{
         .cluster_id = cluster_id,
@@ -82,9 +88,20 @@ pub fn main() !void {
         .seed = random.int(u64),
         .releases = &releases,
         .client_release = releases[0].release,
-        .network = .{ .node_count = node_count, .client_count = client_count, .seed = random.int(u64), .path_maximum_capacity = 2, .recorded_count_max = 0, .simulation_options = .{
-            .simulation_type = .Simple,
-        } },
+        .network = .{
+            .node_count = node_count,
+            .client_count = client_count,
+            .seed = random.int(u64),
+            .path_maximum_capacity = 2,
+            .recorded_count_max = 0,
+            .simulation_options = .{
+                .simulation_type = .Simple,
+                .context = &trace_recorder,
+                .message_send_handler = message_trace_recorder.send_handler,
+                .message_receive_handler = message_trace_recorder.receive_handler,
+                .simulation_trace = null,
+            },
+        },
         .storage = .{
             .read_latency_min = 0,
             .read_latency_mean = 0,
@@ -106,7 +123,7 @@ pub fn main() !void {
     const orchestrator_options = Orchestrator.Options{
         .cluster = cluster_options,
         .workload = workload_options,
-        .requests_max = constants.journal_slot_count * 3,
+        .requests_max = 10,
     };
 
     var orchestrator = try Orchestrator.init(allocator, random, orchestrator_options);
@@ -140,15 +157,10 @@ pub fn main() !void {
         } else false;
 
         if (requests_done and upgrades_done) break;
-    } else {
-        output.info(
-            "no liveness, final cluster state (requests_max={} requests_replied={}):",
-            .{ orchestrator.options.requests_max, orchestrator.requests_replied },
-        );
-        orchestrator.cluster.log_cluster();
-
-        return;
     }
+    trace_recorder.record_trace() catch |err| {
+        output.info("failed to record trace: {}", .{err});
+    };
 }
 
 var log_buffer: std.io.BufferedWriter(4096, std.fs.File.Writer) = .{
